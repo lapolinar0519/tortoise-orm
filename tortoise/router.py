@@ -1,7 +1,10 @@
-from typing import TYPE_CHECKING, List, Optional, Type
+from __future__ import annotations
 
-from tortoise.exceptions import ParamsError
-from tortoise.transactions import get_connection
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+from tortoise.connection import get_connection
+from tortoise.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
     from tortoise import BaseDBAsyncClient, Model
@@ -9,12 +12,12 @@ if TYPE_CHECKING:
 
 class ConnectionRouter:
     def __init__(self) -> None:
-        self._routers: List[type] = None  # type: ignore
+        self._routers: list[type] = None  # type: ignore
 
-    def init_routers(self, routers: List[type]):
+    def init_routers(self, routers: list[Callable]) -> None:
         self._routers = [r() for r in routers]
 
-    def _router_func(self, model: Type["Model"], action: str):
+    def _router_func(self, model: type[Model], action: str) -> Any:
         for r in self._routers:
             try:
                 method = getattr(r, action)
@@ -26,16 +29,22 @@ class ConnectionRouter:
                 if chosen_db:
                     return chosen_db
 
-    def _db_route(self, model: Type["Model"], action: str):
+    def _db_route(self, model: type[Model], action: str) -> BaseDBAsyncClient | None:
         try:
             return get_connection(self._router_func(model, action))
-        except ParamsError:
+        except ConfigurationError:
             return None
 
-    def db_for_read(self, model: Type["Model"]) -> Optional["BaseDBAsyncClient"]:
+    def db_for_read(self, model: type[Model]) -> BaseDBAsyncClient | None:
+        if not self._routers:
+            return None
+
         return self._db_route(model, "db_for_read")
 
-    def db_for_write(self, model: Type["Model"]) -> Optional["BaseDBAsyncClient"]:
+    def db_for_write(self, model: type[Model]) -> BaseDBAsyncClient | None:
+        if not self._routers:
+            return None
+
         return self._db_route(model, "db_for_write")
 
 

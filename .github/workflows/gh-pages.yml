@@ -1,26 +1,24 @@
 name: gh-pages
 on:
-  push:
-    branches:
-      - develop
+  workflow_dispatch:
+  release:
+    types:
+      - created
 jobs:
-  gh-pages:
+  publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v1
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
-      - name: Install and configure Poetry
-        uses: snok/install-poetry@v1.1.1
-        with:
-          virtualenvs-create: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Build docs
         run: make docs
-      - name: Deploy docs
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Deploy latest docs
+        uses: peaceiris/actions-gh-pages@v4
         with:
           personal_token: ${{ secrets.PERSONAL_TOKEN }}
           publish_dir: build/html
           external_repository: tortoise/tortoise.github.io
-          publish_branch: master
+          publish_branch: main

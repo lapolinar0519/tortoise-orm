@@ -1,19 +1,23 @@
+from __future__ import annotations
+
 import asyncio
 import logging
+from collections.abc import Iterable
 from types import ModuleType
-from typing import Dict, Iterable, Optional, Union
 
 from quart import Quart  # pylint: disable=E0401
 
 from tortoise import Tortoise
+from tortoise.connection import get_connections
+from tortoise.log import logger
 
 
 def register_tortoise(
     app: Quart,
-    config: Optional[dict] = None,
-    config_file: Optional[str] = None,
-    db_url: Optional[str] = None,
-    modules: Optional[Dict[str, Iterable[Union[str, ModuleType]]]] = None,
+    config: dict | None = None,
+    config_file: str | None = None,
+    db_url: str | None = None,
+    modules: dict[str, Iterable[str | ModuleType]] | None = None,
     generate_schemas: bool = False,
 ) -> None:
     """
@@ -83,15 +87,15 @@ def register_tortoise(
     @app.before_serving
     async def init_orm() -> None:  # pylint: disable=W0612
         await Tortoise.init(config=config, config_file=config_file, db_url=db_url, modules=modules)
-        logging.info("Tortoise-ORM started, %s, %s", Tortoise._connections, Tortoise.apps)
+        logger.info("Tortoise-ORM started, %s, %s", get_connections()._get_storage(), Tortoise.apps)
         if _generate_schemas:
-            logging.info("Tortoise-ORM generating schema")
+            logger.info("Tortoise-ORM generating schema")
             await Tortoise.generate_schemas()
 
     @app.after_serving
     async def close_orm() -> None:  # pylint: disable=W0612
         await Tortoise.close_connections()
-        logging.info("Tortoise-ORM shutdown")
+        logger.info("Tortoise-ORM shutdown")
 
     @app.cli.command()  # type: ignore
     def generate_schemas() -> None:  # pylint: disable=E0102
@@ -104,6 +108,6 @@ def register_tortoise(
             await Tortoise.generate_schemas()
             await Tortoise.close_connections()
 
-        logging.basicConfig(level=logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
         loop = asyncio.get_event_loop()
         loop.run_until_complete(inner())

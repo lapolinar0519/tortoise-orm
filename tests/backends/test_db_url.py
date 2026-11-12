@@ -1,405 +1,688 @@
+import pytest
+
 from tortoise.backends.base.config_generator import expand_db_url, generate_config
-from tortoise.contrib import test
 from tortoise.exceptions import ConfigurationError
 
+# These are pure logic tests - no database fixture needed
 
-class TestConfigGenerator(test.SimpleTestCase):
-    def test_unknown_scheme(self):
-        with self.assertRaises(ConfigurationError):
-            expand_db_url("moo://baa")
+_postgres_scheme_engines = {
+    "postgres": "tortoise.backends.asyncpg",
+    "postgresql": "tortoise.backends.asyncpg",
+    "asyncpg": "tortoise.backends.asyncpg",
+    "psycopg": "tortoise.backends.psycopg",
+}
 
-    def test_sqlite_basic(self):
-        res = expand_db_url("sqlite:///some/test.sqlite")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": "/some/test.sqlite",
-                    "journal_mode": "WAL",
-                    "journal_size_limit": 16384,
-                },
+
+def test_unknown_scheme():
+    with pytest.raises(ConfigurationError):
+        expand_db_url("moo://baa")
+
+
+@pytest.mark.parametrize(
+    "db_url,option",
+    [
+        ("mysql://root@localhost/test?sql_mode=", "sql_mode"),
+        ("mysql://root@localhost/test?sql_mode=ANSI&sql_mode=", "sql_mode"),
+    ],
+)
+def test_explicit_empty_string_parameter(db_url, option):
+    assert expand_db_url(db_url)["credentials"][option] == ""
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("sql_mode=&sql_mode=ANSI", "ANSI"),
+        ("sql_mode=ANSI&sql_mode=TRADITIONAL", "TRADITIONAL"),
+    ],
+)
+def test_string_parameter_last_value(query, expected):
+    assert (
+        expand_db_url(f"mysql://root@localhost/test?{query}")["credentials"]["sql_mode"] == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("connect_timeout=", None),
+        ("connect_timeout=1.5&connect_timeout=", 1.5),
+        ("connect_timeout=&connect_timeout=1.5", 1.5),
+        ("connect_timeout=1&connect_timeout=2.5", 2.5),
+        ("minsize=", None),
+        ("minsize=2&minsize=", 2),
+        ("echo=", None),
+        ("echo=True&echo=", True),
+    ],
+)
+def test_blank_typed_parameters_keep_previous_behavior(query, expected):
+    option = query.partition("=")[0]
+    credentials = expand_db_url(f"mysql://root@localhost/test?{query}")["credentials"]
+    if expected is None:
+        assert option not in credentials
+    else:
+        assert credentials[option] == expected
+        assert type(credentials[option]) is type(expected)
+
+
+def test_blank_typed_parameter_keeps_default():
+    credentials = expand_db_url("sqlite://test.sqlite?journal_size_limit=")["credentials"]
+    assert credentials["journal_size_limit"] == 16384
+
+
+def test_blank_typed_parameter_does_not_hide_invalid_value():
+    with pytest.raises(ValueError):
+        expand_db_url("mysql://root@localhost/test?connect_timeout=invalid&connect_timeout=")
+
+
+@pytest.mark.parametrize(
+    "db_url,option,expected",
+    [
+        ("mysql://root@localhost/test?charset=", "charset", "utf8mb4"),
+        ("mysql://root@localhost/test?init_command=", "init_command", None),
+        ("sqlite://:memory:?journal_mode=", "journal_mode", "WAL"),
+        ("sqlite://:memory:?foreign_keys=", "foreign_keys", None),
+        ("psycopg://postgres@localhost/test?options=", "options", None),
+        ("postgres://postgres@localhost/test?connection_class=", "connection_class", None),
+        ("postgres://postgres@localhost/test?loop=", "loop", None),
+    ],
+)
+def test_other_blank_backend_options_keep_defaults(db_url, option, expected):
+    credentials = expand_db_url(db_url)["credentials"]
+    if expected is None:
+        assert option not in credentials
+    else:
+        assert credentials[option] == expected
+
+
+@pytest.mark.parametrize("scheme", [*_postgres_scheme_engines, "mysql"])
+def test_blank_connection_fields_keep_fallbacks(scheme):
+    credentials = expand_db_url(f"{scheme}:///test?host=&user=&password=&port=")["credentials"]
+    assert credentials["host"] is None
+    assert credentials["user"] is None
+    assert credentials["password"] == ("" if scheme == "mysql" else None)
+    assert credentials["port"] == (3306 if scheme == "mysql" else 5432)
+
+
+@pytest.mark.parametrize("scheme", [*_postgres_scheme_engines, "mysql"])
+def test_blank_connection_fields_keep_last_nonblank_value(scheme):
+    credentials = expand_db_url(
+        f"{scheme}:///test?host=localhost&host=&user=example&user="
+        "&password=example&password=&port=1234&port="
+    )["credentials"]
+    assert credentials["host"] == "localhost"
+    assert credentials["user"] == "example"
+    assert credentials["password"] == "example"
+    assert credentials["port"] == "1234"
+
+
+def test_sqlite_basic():
+    res = expand_db_url("sqlite:///some/test.sqlite")
+    assert res == {
+        "engine": "tortoise.backends.sqlite",
+        "credentials": {
+            "file_path": "/some/test.sqlite",
+            "journal_mode": "WAL",
+            "journal_size_limit": 16384,
+        },
+    }
+
+
+def test_sqlite_no_db():
+    with pytest.raises(ConfigurationError, match="No path specified for DB_URL"):
+        expand_db_url("sqlite://")
+
+
+def test_sqlite_relative():
+    res = expand_db_url("sqlite://test.sqlite")
+    assert res == {
+        "engine": "tortoise.backends.sqlite",
+        "credentials": {
+            "file_path": "test.sqlite",
+            "journal_mode": "WAL",
+            "journal_size_limit": 16384,
+        },
+    }
+
+
+def test_sqlite_relative_with_subdir():
+    res = expand_db_url("sqlite://data/db.sqlite")
+    assert res == {
+        "engine": "tortoise.backends.sqlite",
+        "credentials": {
+            "file_path": "data/db.sqlite",
+            "journal_mode": "WAL",
+            "journal_size_limit": 16384,
+        },
+    }
+
+
+def test_sqlite_testing():
+    res = expand_db_url(db_url="sqlite:///some/test-{}.sqlite", testing=True)
+    file_path = res["credentials"]["file_path"]
+    assert "/some/test-" in file_path
+    assert ".sqlite" in file_path
+    assert file_path != "sqlite:///some/test-{}.sqlite"
+    assert res == {
+        "engine": "tortoise.backends.sqlite",
+        "credentials": {
+            "file_path": file_path,
+            "journal_mode": "WAL",
+            "journal_size_limit": 16384,
+        },
+    }
+
+
+def test_sqlite_params():
+    res = expand_db_url("sqlite:///some/test.sqlite?AHA=5&moo=yes&journal_mode=TRUNCATE")
+    assert res == {
+        "engine": "tortoise.backends.sqlite",
+        "credentials": {
+            "file_path": "/some/test.sqlite",
+            "AHA": "5",
+            "moo": "yes",
+            "journal_mode": "TRUNCATE",
+            "journal_size_limit": 16384,
+        },
+    }
+
+
+def test_sqlite_invalid():
+    with pytest.raises(ConfigurationError):
+        expand_db_url("sqlite://")
+
+
+def test_postgres_basic():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres:moo@127.0.0.1:54321/test")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "127.0.0.1",
+                "password": "moo",
+                "port": 54321,
+                "user": "postgres",
             },
-        )
+        }
 
-    def test_sqlite_no_db(self):
-        with self.assertRaisesRegex(ConfigurationError, "No path specified for DB_URL"):
-            expand_db_url("sqlite://")
 
-    def test_sqlite_relative(self):
-        res = expand_db_url("sqlite://test.sqlite")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": "test.sqlite",
-                    "journal_mode": "WAL",
-                    "journal_size_limit": 16384,
-                },
+def test_postgres_encoded_password():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres:kx%25jj5%2Fg@127.0.0.1:54321/test")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "127.0.0.1",
+                "password": "kx%jj5/g",
+                "port": 54321,
+                "user": "postgres",
             },
-        )
+        }
 
-    def test_sqlite_relative_with_subdir(self):
-        res = expand_db_url("sqlite://data/db.sqlite")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": "data/db.sqlite",
-                    "journal_mode": "WAL",
-                    "journal_size_limit": 16384,
-                },
+
+def test_postgres_no_db():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres:moo@127.0.0.1:54321")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": None,
+                "host": "127.0.0.1",
+                "password": "moo",
+                "port": 54321,
+                "user": "postgres",
             },
-        )
+        }
 
-    def test_sqlite_testing(self):
-        res = expand_db_url(db_url="sqlite:///some/test-{}.sqlite", testing=True)
-        file_path = res["credentials"]["file_path"]
-        self.assertIn("/some/test-", file_path)
-        self.assertIn(".sqlite", file_path)
-        self.assertNotEqual("sqlite:///some/test-{}.sqlite", file_path)
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": file_path,
-                    "journal_mode": "WAL",
-                    "journal_size_limit": 16384,
-                },
+
+def test_postgres_no_port():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres@127.0.0.1/test")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "127.0.0.1",
+                "password": None,
+                "port": 5432,
+                "user": "postgres",
             },
-        )
+        }
 
-    def test_sqlite_params(self):
-        res = expand_db_url("sqlite:///some/test.sqlite?AHA=5&moo=yes&journal_mode=TRUNCATE")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.sqlite",
-                "credentials": {
-                    "file_path": "/some/test.sqlite",
-                    "AHA": "5",
-                    "moo": "yes",
-                    "journal_mode": "TRUNCATE",
-                    "journal_size_limit": 16384,
-                },
-            },
-        )
 
-    def test_sqlite_invalid(self):
-        with self.assertRaises(ConfigurationError):
-            expand_db_url("sqlite://")
-
-    def test_postgres_basic(self):
-        res = expand_db_url("postgres://postgres:moo@127.0.0.1:54321/test")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "moo",
-                    "port": 54321,
-                    "user": "postgres",
-                },
-            },
-        )
-
-    def test_postgres_encoded_password(self):
-        res = expand_db_url("postgres://postgres:kx%25jj5%2Fg@127.0.0.1:54321/test")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "kx%jj5/g",
-                    "port": 54321,
-                    "user": "postgres",
-                },
-            },
-        )
-
-    def test_postgres_no_db(self):
-        res = expand_db_url("postgres://postgres:moo@127.0.0.1:54321")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": None,
-                    "host": "127.0.0.1",
-                    "password": "moo",
-                    "port": 54321,
-                    "user": "postgres",
-                },
-            },
-        )
-
-    def test_postgres_no_port(self):
-        res = expand_db_url("postgres://postgres@127.0.0.1/test")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": None,
-                    "port": 5432,
-                    "user": "postgres",
-                },
-            },
-        )
-
-    def test_postgres_nonint_port(self):
-        with self.assertRaises(ConfigurationError):
-            expand_db_url("postgres://postgres:@127.0.0.1:moo/test")
-
-    def test_postgres_testing(self):
-        res = expand_db_url(db_url=r"postgres://postgres:@127.0.0.1:5432/test_\{\}", testing=True)
-        database = res["credentials"]["database"]
-        self.assertIn("test_", database)
-        self.assertNotEqual("test_{}", database)
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": database,
-                    "host": "127.0.0.1",
-                    "password": None,
-                    "port": 5432,
-                    "user": "postgres",
-                },
-            },
-        )
-
-    def test_postgres_params(self):
-        res = expand_db_url("postgres://postgres:@127.0.0.1:5432/test?AHA=5&moo=yes")
-        self.assertDictEqual(
-            res,
-            {
-                "engine": "tortoise.backends.asyncpg",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": None,
-                    "port": 5432,
-                    "user": "postgres",
-                    "AHA": "5",
-                    "moo": "yes",
-                },
-            },
-        )
-
-    def test_mysql_basic(self):
-        res = expand_db_url("mysql://root:@127.0.0.1:33060/test")
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "",
-                    "port": 33060,
-                    "user": "root",
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
-                },
-            },
-        )
-
-    def test_mysql_encoded_password(self):
-        res = expand_db_url("mysql://root:kx%25jj5%2Fg@127.0.0.1:33060/test")
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "kx%jj5/g",
-                    "port": 33060,
-                    "user": "root",
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
-                },
-            },
-        )
-
-    def test_mysql_no_db(self):
-        res = expand_db_url("mysql://root:@127.0.0.1:33060")
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
-                "credentials": {
-                    "database": None,
-                    "host": "127.0.0.1",
-                    "password": "",
-                    "port": 33060,
-                    "user": "root",
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
-                },
-            },
-        )
-
-    def test_mysql_no_port(self):
-        res = expand_db_url("mysql://root@127.0.0.1/test")
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
-                "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "",
-                    "port": 3306,
-                    "user": "root",
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
-                },
-            },
-        )
-
-    def test_mysql_nonint_port(self):
-        with self.assertRaises(ConfigurationError):
-            expand_db_url("mysql://root:@127.0.0.1:moo/test")
-
-    def test_mysql_testing(self):
-        res = expand_db_url(r"mysql://root:@127.0.0.1:3306/test_\{\}", testing=True)
-        self.assertIn("test_", res["credentials"]["database"])
-        self.assertNotEqual("test_{}", res["credentials"]["database"])
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
-                "credentials": {
-                    "database": res["credentials"]["database"],
-                    "host": "127.0.0.1",
-                    "password": "",
-                    "port": 3306,
-                    "user": "root",
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
-                },
-            },
-        )
-
-    def test_mysql_params(self):
+def test_postgres_unix_socket_query_params():
+    for scheme, engine in _postgres_scheme_engines.items():
         res = expand_db_url(
-            "mysql://root:@127.0.0.1:3306/test?AHA=5&moo=yes&maxsize=20&minsize=5"
-            "&connect_timeout=1.5&echo=1"
+            f"{scheme}:///test?host=/cloudsql/x:y:z/.s.PGSQL.5432&user=postgres&password=pass"
         )
-        self.assertEqual(
-            res,
-            {
-                "engine": "tortoise.backends.mysql",
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "/cloudsql/x:y:z/.s.PGSQL.5432",
+                "password": "pass",
+                "port": 5432,
+                "user": "postgres",
+            },
+        }
+
+
+def test_postgres_url_authority_wins_over_query_params():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(
+            f"{scheme}://pguser:pgpass@mydomain.com:5433/test?port=5430&user=ignore-me"
+        )
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "mydomain.com",
+                "password": "pgpass",
+                "port": 5433,
+                "user": "pguser",
+            },
+        }
+
+
+def test_postgres_nonint_port():
+    for scheme in _postgres_scheme_engines:
+        with pytest.raises(ConfigurationError):
+            expand_db_url(f"{scheme}://postgres:@127.0.0.1:moo/test")
+
+
+def test_postgres_testing():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(
+            db_url=(f"{scheme}://postgres@127.0.0.1:5432/" + r"test_\{\}"), testing=True
+        )
+        database = res["credentials"]["database"]
+        assert "test_" in database
+        assert database != "test_{}"
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": database,
+                "host": "127.0.0.1",
+                "password": None,
+                "port": 5432,
+                "user": "postgres",
+            },
+        }
+
+
+def test_postgres_params():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres@127.0.0.1:5432/test?AHA=5&moo=yes")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": "127.0.0.1",
+                "password": None,
+                "port": 5432,
+                "user": "postgres",
+                "AHA": "5",
+                "moo": "yes",
+            },
+        }
+
+
+def test_mysql_special_chars_in_password():
+    db_url = "mysql://some_user:ADM[r$VIS]@test-rds.somedata.net:3306/mydb?charset=utf8mb4"
+    res = expand_db_url(db_url)
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "mydb",
+            "host": "test-rds.somedata.net",
+            "password": "ADM[r$VIS]",
+            "port": 3306,
+            "user": "some_user",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_unbalanced_brackets_in_password():
+    db_url = "mysql://fail_user:DMK_15[ZWIN6@test-rds.somedata.net:3306/mydb2?charset=utf8mb4"
+    res = expand_db_url(db_url)
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "mydb2",
+            "host": "test-rds.somedata.net",
+            "password": "DMK_15[ZWIN6",
+            "port": 3306,
+            "user": "fail_user",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_literal_percent_in_password_is_corrupted():
+    # Known limitation: a literal '%' followed by valid hex (e.g. '%ba') gets
+    # decoded by unquote_plus, corrupting the password. Users must pre-encode
+    # '%' as '%25' in their URLs to avoid this.
+    db_url = "mysql://user:foo%bar@127.0.0.1:3306/mydb"
+    res = expand_db_url(db_url)
+    assert res["credentials"]["password"] != "foo%bar"
+
+
+def test_mysql_pre_encoded_percent_in_password():
+    db_url = "mysql://user:foo%25bar@127.0.0.1:3306/mydb"
+    res = expand_db_url(db_url)
+    assert res["credentials"]["password"] == "foo%bar"
+
+
+def test_postgres_plus_sign_in_password():
+    for scheme in _postgres_scheme_engines:
+        res = expand_db_url(f"{scheme}://postgres:p%2Bss+word@127.0.0.1:54321/test")
+        assert res["credentials"]["password"] == "p+ss+word"
+
+
+def test_mysql_basic():
+    res = expand_db_url("mysql://root:@127.0.0.1:33060/test")
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "test",
+            "host": "127.0.0.1",
+            "password": "",
+            "port": 33060,
+            "user": "root",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_encoded_password():
+    res = expand_db_url("mysql://root:kx%25jj5%2Fg@127.0.0.1:33060/test")
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "test",
+            "host": "127.0.0.1",
+            "password": "kx%jj5/g",
+            "port": 33060,
+            "user": "root",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_no_db():
+    res = expand_db_url("mysql://root:@127.0.0.1:33060")
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": None,
+            "host": "127.0.0.1",
+            "password": "",
+            "port": 33060,
+            "user": "root",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_no_port():
+    res = expand_db_url("mysql://root@127.0.0.1/test")
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "test",
+            "host": "127.0.0.1",
+            "password": "",
+            "port": 3306,
+            "user": "root",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_nonint_port():
+    with pytest.raises(ConfigurationError):
+        expand_db_url("mysql://root:@127.0.0.1:moo/test")
+
+
+def test_mysql_testing():
+    res = expand_db_url(r"mysql://root:@127.0.0.1:3306/test_\{\}", testing=True)
+    assert "test_" in res["credentials"]["database"]
+    assert res["credentials"]["database"] != "test_{}"
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": res["credentials"]["database"],
+            "host": "127.0.0.1",
+            "password": "",
+            "port": 3306,
+            "user": "root",
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+        },
+    }
+
+
+def test_mysql_params():
+    res = expand_db_url(
+        "mysql://root:@127.0.0.1:3306/test?AHA=5&moo=yes&maxsize=20&minsize=5"
+        "&connect_timeout=1.5&echo=1&ssl=True"
+    )
+    assert res == {
+        "engine": "tortoise.backends.mysql",
+        "credentials": {
+            "database": "test",
+            "host": "127.0.0.1",
+            "password": "",
+            "port": 3306,
+            "user": "root",
+            "AHA": "5",
+            "moo": "yes",
+            "minsize": 5,
+            "maxsize": 20,
+            "connect_timeout": 1.5,
+            "echo": True,
+            "charset": "utf8mb4",
+            "sql_mode": "STRICT_TRANS_TABLES",
+            "ssl": True,
+        },
+    }
+
+
+def test_generate_config_basic():
+    res = generate_config(
+        db_url="sqlite:///some/test.sqlite",
+        app_modules={"models": ["one.models", "two.models"]},
+    )
+    assert res == {
+        "connections": {
+            "default": {
                 "credentials": {
-                    "database": "test",
-                    "host": "127.0.0.1",
-                    "password": "",
-                    "port": 3306,
-                    "user": "root",
-                    "AHA": "5",
-                    "moo": "yes",
-                    "minsize": 5,
-                    "maxsize": 20,
-                    "connect_timeout": 1.5,
-                    "echo": True,
-                    "charset": "utf8mb4",
-                    "sql_mode": "STRICT_TRANS_TABLES",
+                    "file_path": "/some/test.sqlite",
+                    "journal_mode": "WAL",
+                    "journal_size_limit": 16384,
                 },
-            },
-        )
+                "engine": "tortoise.backends.sqlite",
+            }
+        },
+        "apps": {
+            "models": {
+                "models": ["one.models", "two.models"],
+                "default_connection": "default",
+            }
+        },
+    }
 
-    def test_generate_config_basic(self):
-        res = generate_config(
-            db_url="sqlite:///some/test.sqlite",
-            app_modules={"models": ["one.models", "two.models"]},
-        )
-        self.assertEqual(
-            res,
-            {
-                "connections": {
-                    "default": {
-                        "credentials": {
-                            "file_path": "/some/test.sqlite",
-                            "journal_mode": "WAL",
-                            "journal_size_limit": 16384,
-                        },
-                        "engine": "tortoise.backends.sqlite",
-                    }
-                },
-                "apps": {
-                    "models": {
-                        "models": ["one.models", "two.models"],
-                        "default_connection": "default",
-                    }
-                },
-            },
-        )
 
-    def test_generate_config_explicit(self):
-        res = generate_config(
-            db_url="sqlite:///some/test.sqlite",
-            app_modules={"models": ["one.models", "two.models"]},
-            connection_label="models",
-            testing=True,
-        )
-        self.assertEqual(
-            res,
-            {
-                "connections": {
-                    "models": {
-                        "credentials": {
-                            "file_path": "/some/test.sqlite",
-                            "journal_mode": "WAL",
-                            "journal_size_limit": 16384,
-                        },
-                        "engine": "tortoise.backends.sqlite",
-                    }
+def test_generate_config_explicit():
+    res = generate_config(
+        db_url="sqlite:///some/test.sqlite",
+        app_modules={"models": ["one.models", "two.models"]},
+        connection_label="models",
+        testing=True,
+    )
+    assert res == {
+        "connections": {
+            "models": {
+                "credentials": {
+                    "file_path": "/some/test.sqlite",
+                    "journal_mode": "WAL",
+                    "journal_size_limit": 16384,
                 },
-                "apps": {
-                    "models": {
-                        "models": ["one.models", "two.models"],
-                        "default_connection": "models",
-                    }
-                },
-            },
-        )
+                "engine": "tortoise.backends.sqlite",
+            }
+        },
+        "apps": {
+            "models": {
+                "models": ["one.models", "two.models"],
+                "default_connection": "models",
+            }
+        },
+    }
 
-    def test_generate_config_many_apps(self):
-        res = generate_config(
-            db_url="sqlite:///some/test.sqlite",
-            app_modules={"models": ["one.models", "two.models"], "peanuts": ["peanut.models"]},
-        )
-        self.assertEqual(
-            res,
-            {
-                "connections": {
-                    "default": {
-                        "credentials": {
-                            "file_path": "/some/test.sqlite",
-                            "journal_mode": "WAL",
-                            "journal_size_limit": 16384,
-                        },
-                        "engine": "tortoise.backends.sqlite",
-                    }
+
+def test_generate_config_many_apps():
+    res = generate_config(
+        db_url="sqlite:///some/test.sqlite",
+        app_modules={"models": ["one.models", "two.models"], "peanuts": ["peanut.models"]},
+    )
+    assert res == {
+        "connections": {
+            "default": {
+                "credentials": {
+                    "file_path": "/some/test.sqlite",
+                    "journal_mode": "WAL",
+                    "journal_size_limit": 16384,
                 },
-                "apps": {
-                    "models": {
-                        "models": ["one.models", "two.models"],
-                        "default_connection": "default",
-                    },
-                    "peanuts": {"models": ["peanut.models"], "default_connection": "default"},
-                },
+                "engine": "tortoise.backends.sqlite",
+            }
+        },
+        "apps": {
+            "models": {
+                "models": ["one.models", "two.models"],
+                "default_connection": "default",
             },
+            "peanuts": {"models": ["peanut.models"], "default_connection": "default"},
+        },
+    }
+
+
+@pytest.mark.parametrize("scheme", ["asyncpg", "mysql"])
+@pytest.mark.parametrize(
+    "encoded, expected", [("first%40last", "first@last"), ("a+b", "a+b"), ("%252F", "%2F")]
+)
+def test_username_is_percent_decoded_once(scheme, encoded, expected):
+    config = expand_db_url(f"{scheme}://{encoded}:example@localhost/db")
+    assert config["credentials"]["user"] == expected
+
+
+def test_query_string_username_is_not_decoded_twice():
+    config = expand_db_url("asyncpg://localhost/db?user=%252F")
+    assert config["credentials"]["user"] == "%2F"
+
+
+@pytest.mark.parametrize(
+    "url, key",
+    [
+        ("asyncpg://example:example@localhost/db", "ssl"),
+        ("mysql://example:example@localhost/db", "use_unicode"),
+        ("sqlite://:memory:", "install_regexp_functions"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("FALSE", False),
+        ("0", False),
+        ("True", True),
+        ("yes", True),
+        ("ON", True),
+        ("invalid", False),
+    ],
+)
+def test_boolean_url_option(url, key, value, expected):
+    config = expand_db_url(f"{url}?{key}={value}")
+    assert config["credentials"][key] is expected
+
+
+def test_postgres_multi_host_shared_port():
+    for scheme, engine in _postgres_scheme_engines.items():
+        res = expand_db_url(f"{scheme}://postgres:moo@host1,host2:5433/test")
+        assert res == {
+            "engine": engine,
+            "credentials": {
+                "database": "test",
+                "host": ["host1", "host2"],
+                "password": "moo",
+                "port": [5432, 5433],
+                "user": "postgres",
+            },
+        }
+
+
+def test_postgres_multi_host_no_port():
+    for scheme in _postgres_scheme_engines:
+        res = expand_db_url(f"{scheme}://postgres@host1,host2/test")
+        assert res["credentials"]["host"] == ["host1", "host2"]
+        assert res["credentials"]["port"] == [5432, 5432]
+
+
+def test_postgres_multi_host_ports_and_params():
+    for scheme in _postgres_scheme_engines:
+        res = expand_db_url(
+            f"{scheme}://postgres@host1:5433,host2:5434/test?target_session_attrs=read-write"
         )
+        assert res["credentials"]["host"] == ["host1", "host2"]
+        assert res["credentials"]["port"] == [5433, 5434]
+        assert res["credentials"]["target_session_attrs"] == "read-write"
+
+
+def test_postgres_multi_host_ipv6():
+    res = expand_db_url("postgres://postgres@[::1]:5433,[fe80::2]/test")
+    assert res["credentials"]["host"] == ["::1", "fe80::2"]
+    assert res["credentials"]["port"] == [5433, 5432]
+
+
+def test_postgres_multi_host_ipv6_brackets_without_ports():
+    res = expand_db_url("postgres://postgres:moo@[::1],[::2]:5433/test")
+    assert res["credentials"]["host"] == ["::1", "::2"]
+    assert res["credentials"]["port"] == [5432, 5433]
+    assert res["credentials"]["password"] == "moo"
+
+
+def test_postgres_multi_host_normalised_like_single_host():
+    res = expand_db_url("postgres://postgres@H1 ,Host2:5433/test")
+    assert res["credentials"]["host"] == ["h1", "host2"]
+
+
+def test_postgres_multi_host_query_port_is_default():
+    res = expand_db_url("postgres://postgres@host1,host2:5434/test?port=5430")
+    assert res["credentials"]["port"] == [5430, 5434]
+
+
+@pytest.mark.parametrize(
+    "db_url, message",
+    [
+        ("postgres://postgres@host1,host2:abc/test", "Port is not an integer"),
+        ("postgres://postgres@host1,/test", "Empty host"),
+        ("postgres://postgres@,host2/test", "Empty host"),
+        ("postgres://postgres@host1,host2:99999/test", "Port must be between 1 and 65535"),
+        ("postgres://postgres@host1,host2:0/test", "Port must be between 1 and 65535"),
+    ],
+)
+def test_postgres_multi_host_invalid(db_url, message):
+    with pytest.raises(ConfigurationError, match=message):
+        expand_db_url(db_url)
+
+
+def test_multi_host_only_for_postgres():
+    res = expand_db_url("mysql://root@host1,host2:3307/test")
+    assert res["credentials"]["host"] == "host1,host2"

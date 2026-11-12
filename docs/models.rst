@@ -9,18 +9,18 @@ Models
 Usage
 =====
 
-To get working with models, first you should import them
+All models should be derived from ``Model``. To start describing the models, import ``Model`` from ``tortoise.models``.
 
 .. code-block:: python3
 
     from tortoise.models import Model
 
-With that you can start describing your own models like that
+With that start describing the models
 
 .. code-block:: python3
 
     class Tournament(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.TextField()
         created = fields.DatetimeField(auto_now_add=True)
 
@@ -29,7 +29,7 @@ With that you can start describing your own models like that
 
 
     class Event(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.TextField()
         tournament = fields.ForeignKeyField('models.Tournament', related_name='events')
         participants = fields.ManyToManyField('models.Team', related_name='events', through='event_team')
@@ -41,24 +41,24 @@ With that you can start describing your own models like that
 
 
     class Team(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.TextField()
 
         def __str__(self):
             return self.name
 
-Let see in details what we accomplished here:
+Let's look at the details of what we accomplished here:
 
 .. code-block:: python3
 
     class Tournament(Model):
 
-Every model should be derived from base model. You also can derive from your own model subclasses and you can make abstract models like this
+Every model should be derived from ``Model`` or its subclasses. Custom ``Model`` subclasses can be created in the following way:
 
 .. code-block:: python3
 
     class AbstractTournament(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.TextField()
         created = fields.DatetimeField(auto_now_add=True)
 
@@ -68,10 +68,21 @@ Every model should be derived from base model. You also can derive from your own
         def __str__(self):
             return self.name
 
-This models won't be created in schema generation and won't create relations to other models.
+This model will not affect the schema, but it will be available for inheritance.
 
 
-Further we have field ``fields.DatetimeField(auto_now=True)``. Options ``auto_now`` and ``auto_now_add`` work like Django's options.
+Further we have field ``fields.DatetimeField(auto_now=True)``. Options ``auto_now`` and ``auto_now_add`` work like Django's options — they are handled purely in Python and do **not** add a ``DEFAULT`` clause to the database schema. If you need a database-level default timestamp, use ``db_default``:
+
+.. code-block:: python3
+
+    from tortoise.fields import DatetimeField, Now
+
+    class MyModel(Model):
+        # Python-only: value set by ORM on save, no DB DEFAULT
+        modified = DatetimeField(auto_now=True)
+
+        # DB-level: emits DEFAULT CURRENT_TIMESTAMP in the schema
+        created_at = DatetimeField(db_default=Now())
 
 Use of ``__models__``
 ---------------------
@@ -81,7 +92,7 @@ If you define the variable ``__models__`` in the module which you load your mode
 Primary Keys
 ------------
 
-In Tortoise ORM we require that a model has a primary key.
+In Tortoise ORM, every model must have a primary key.
 
 That primary key will be accessible through a reserved field ``pk`` which will be an alias of whichever field has been nominated as a primary key.
 That alias field can be used as a field name when doing filtering e.g. ``.filter(pk=...)`` etc…
@@ -97,21 +108,21 @@ That alias field can be used as a field name when doing filtering e.g. ``.filter
     CharField
     UUIDField
 
-One must define a primary key by setting a ``pk`` parameter to ``True``. 
-If you don't define a primary key, we will create a primary key of type ``IntField`` with name of ``id`` for you.
+One must define a primary key by setting the ``primary_key`` parameter to ``True``.
+If you don't define a primary key, the primary key will be generated as an ``IntField`` with name of ``id``.
 
 .. note::
    If this is used on an Integer Field, ``generated`` will be set to ``True`` unless you explicitly pass ``generated=False`` as well.
 
-Any of these are valid primary key definitions in a Model:
+Any of these are valid primary key definitions:
 
 .. code-block:: python3
 
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
 
-    checksum = fields.CharField(pk=True)
+    checksum = fields.CharField(primary_key=True)
 
-    guid = fields.UUIDField(pk=True)
+    guid = fields.UUIDField(primary_key=True)
 
 
 Inheritance
@@ -141,7 +152,7 @@ Let's have a look at some examples.
         name = fields.CharField(40, unique=True)
 
     class MyAbstractBaseModel(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
 
         class Meta:
             abstract = True
@@ -149,7 +160,7 @@ Let's have a look at some examples.
     class UserModel(TimestampMixin, MyAbstractBaseModel):
         # Overriding the id definition
         # from MyAbstractBaseModel
-        id = fields.UUIDField(pk=True)
+        id = fields.UUIDField(primary_key=True)
 
         # Adding additional fields
         first_name = fields.CharField(20, null=True)
@@ -181,6 +192,11 @@ The ``Meta`` class
         :annotation: = False
 
         Set to ``True`` to indicate this is an abstract class
+
+    .. attribute:: schema
+        :annotation: = ""
+
+        Set this to configure a schema name, where table exists
 
     .. attribute:: table
         :annotation: = ""
@@ -218,6 +234,47 @@ The ``Meta`` class
             indexes=(("field_a", "field_b"), )
             indexes=(("field_a", "field_b"), ("field_c", "field_d", "field_e"))
 
+    .. attribute:: constraints
+        :annotation: = None
+
+        Specify ``constraints`` to add named database constraints to the model.
+        Supports ``UniqueConstraint`` and ``CheckConstraint`` objects, which are
+        tracked by the migration autodetector and generate ``AddConstraint``,
+        ``RemoveConstraint``, and ``RenameConstraint`` operations automatically.
+
+        .. code-block:: python3
+
+            from tortoise.migrations.constraints import CheckConstraint, UniqueConstraint
+
+            class MyModel(Model):
+                name = fields.CharField(max_length=100)
+                category = fields.CharField(max_length=50)
+                score = fields.IntField()
+
+                class Meta:
+                    constraints = [
+                        UniqueConstraint(fields=("name", "category"), name="uid_name_category"),
+                        CheckConstraint(check="score >= 0", name="chk_score_positive"),
+                    ]
+
+        ``UniqueConstraint`` accepts:
+
+        - ``fields`` — tuple of field names (resolved to DB column names, including FK fields).
+        - ``name`` — explicit constraint name. Required for migration tracking.
+        - ``condition`` — *(PostgreSQL only)* a SQL ``WHERE`` clause for partial unique indexes.
+
+        ``CheckConstraint`` accepts:
+
+        - ``check`` — a raw SQL expression for the ``CHECK (...)`` clause.
+        - ``name`` — explicit constraint name. Required.
+
+        .. note::
+
+            ``unique_together`` is the legacy way to define compound unique indexes.
+            ``constraints`` with ``UniqueConstraint`` objects is preferred for new code,
+            as it supports explicit naming, partial indexes (PostgreSQL), and
+            is handled by the migration framework.
+
     .. attribute:: ordering
         :annotation: = None
 
@@ -228,6 +285,26 @@ The ``Meta`` class
         .. code-block:: python3
 
             ordering = ["name", "-score"]
+
+    .. attribute:: fetch_db_defaults
+        :annotation: = True
+
+        When ``True`` (the default), after an INSERT on a non-RETURNING backend
+        (e.g. MySQL), Tortoise will issue a follow-up ``SELECT`` to fetch
+        database-applied default values for fields declared with ``db_default``.
+
+        Set to ``False`` to skip the extra query when you don't need the
+        database-generated values back on the Python instance immediately.
+        On RETURNING backends (PostgreSQL, SQLite) the values are always
+        returned in the INSERT response regardless of this setting.
+
+        .. code-block:: python3
+
+            class MyModel(Model):
+                score = fields.IntField(db_default=0)
+
+                class Meta:
+                    fetch_db_defaults = False
 
     .. attribute:: manager
         :annotation: = tortoise.manager.Manager
@@ -252,7 +329,7 @@ The ``Meta`` class
 In event model we got some more fields, that could be interesting for us.
 
 ``fields.ForeignKeyField('models.Tournament', related_name='events')``
-    Here we create foreign key reference to tournament. We create it by referring to model by it's literal, consisting of app name and model name. ``models`` is default app name, but you can change it in ``class Meta`` with ``app = 'other'``.
+    Here we create foreign key reference to tournament. You can refer to the model either by string literal (``"app_name.ModelName"``) or by passing the model class directly (e.g. ``fields.ForeignKeyField(Tournament)``). String references are required for forward references where the target model is not yet defined. ``models`` is default app name, but you can change it in ``class Meta`` with ``app = 'other'``.
 ``related_name``
     Is keyword argument, that defines field for related query on referenced models, so with that you could fetch all tournaments's events with like this:
 
@@ -303,7 +380,7 @@ This can be chained if the next key is also a foreign object:
 
 There is however one major limitation. We don't want to restrict foreign column names, or have ambiguity (e.g. a foreign object may have a field called ``isnull``)
 
-Then this would be entirely ambigous:
+Then this would be entirely ambiguous:
 
     :samp:`{FKNAME}__isnull`
 
@@ -364,29 +441,29 @@ Async fetch:
 
 .. code-block:: python3
 
-    participants = await tournament.participants.all()
+    participants = await event.participants.all()
 
 You can async iterate over it like this:
 
 .. code-block:: python3
 
-    async for participant in tournament.participants:
+    async for participant in event.participants:
         ...
 
 Sync usage requires that you call `fetch_related` before the time, and then you can use common functions such as:
 
 .. code-block:: python3
 
-    await tournament.fetch_related('participants')
-    participants = list(tournament.participants)
-    participantlen = len(tournament.participants)
-    if SomeParticipant in tournament.participants:
+    await event.fetch_related('participants')
+    participants = list(event.participants)
+    participantlen = len(event.participants)
+    if SomeParticipant in event.participants:
         ...
-    if tournament.participants:
+    if event.participants:
         ...
-    firstparticipant = tournament.participants[0]
+    firstparticipant = event.participants[0]
 
-The reverse lookup of ``team.event_team`` works exactly the same way.
+The reverse lookup of ``team.events`` works exactly the same way.
 
 Improving relational type hinting
 =================================
@@ -408,7 +485,7 @@ all models including fields for the relations between models.
 
 
     class Tournament(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.CharField(max_length=255)
 
         events: fields.ReverseRelation["Event"]
@@ -418,7 +495,7 @@ all models including fields for the relations between models.
 
 
     class Event(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.CharField(max_length=255)
         tournament: fields.ForeignKeyRelation[Tournament] = fields.ForeignKeyField(
             "models.Tournament", related_name="events"
@@ -432,7 +509,7 @@ all models including fields for the relations between models.
 
 
     class Team(Model):
-        id = fields.IntField(pk=True)
+        id = fields.IntField(primary_key=True)
         name = fields.CharField(max_length=255)
 
         events: fields.ManyToManyRelation[Event]

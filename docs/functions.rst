@@ -31,6 +31,11 @@ Functions apply a transform on each instance of a Field.
 
 .. autoclass:: tortoise.functions.Concat
 
+.. autoclass:: tortoise.contrib.mysql.functions.Rand
+
+.. autoclass:: tortoise.contrib.postgres.functions.Random
+
+.. autoclass:: tortoise.contrib.sqlite.functions.Random
 
 Aggregates
 ==========
@@ -60,13 +65,12 @@ Base function class
 
 Custom functions
 ================
-You can custom functions which not builtin, such as ``TruncMonth`` and ``JsonExtract`` etc.
+You can define custom functions which are not builtin, such as ``TruncMonth`` and ``JsonExtract`` etc.
 
 .. code-block:: python3
 
-    from pypika import CustomFunction
-    from tortoise.expressions import F
-    from tortoise.functions import Function
+    from pypika_tortoise import CustomFunction
+    from tortoise.expressions import F, Function
 
     class TruncMonth(Function):
         database_func = CustomFunction("DATE_FORMAT", ["name", "dt_format"])
@@ -80,11 +84,15 @@ And you can also use functions in update, the example is only suitable for MySQL
 .. code-block:: python3
 
     from tortoise.expressions import F
-    from pypika.terms import Function
+    from tortoise.functions import Function
+    from pypika_tortoise.terms import Function as PupikaFunction
 
     class JsonSet(Function):
-        def __init__(self, field: F, expression: str, value: Any):
-            super().__init__("JSON_SET", field, expression, value)
+        class PypikaJsonSet(PupikaFunction):
+            def __init__(self, field: F, expression: str, value: Any):
+                super().__init__("JSON_SET", field, expression, value)
+
+        database_func = PypikaJsonSet
 
     json = await JSONFields.create(data_default={"a": 1})
     json.data_default = JsonSet(F("data_default"), "$.a", 2)

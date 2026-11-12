@@ -1,6 +1,11 @@
-from pypika import Parameter, functions
-from pypika.enums import SqlTypes
-from pypika.terms import Criterion
+import enum
+from typing import Any
+
+from pypika_tortoise import SqlContext
+from pypika_tortoise.enums import SqlTypes
+from pypika_tortoise.functions import Cast, Coalesce, Upper
+from pypika_tortoise.terms import BasicCriterion, Criterion, Term, ValueWrapper
+from pypika_tortoise.utils import format_quotes
 
 from tortoise import Model
 from tortoise.backends.base.executor import BaseExecutor
@@ -10,14 +15,12 @@ from tortoise.contrib.mysql.json_functions import (
     mysql_json_filter,
 )
 from tortoise.contrib.mysql.search import SearchCriterion
+from tortoise.exceptions import UnSupportedError
 from tortoise.fields import BigIntField, IntField, SmallIntField
 from tortoise.filters import (
     Like,
-    Term,
-    ValueWrapper,
     contains,
     ends_with,
-    format_quotes,
     insensitive_contains,
     insensitive_ends_with,
     insensitive_exact,
@@ -25,74 +28,75 @@ from tortoise.filters import (
     json_contained_by,
     json_contains,
     json_filter,
+    posix_regex,
     search,
     starts_with,
 )
 
 
-class StrWrapper(ValueWrapper):  # type: ignore
+class MySQLRegexpComparators(enum.Enum):
+    REGEXP = " REGEXP "
+
+
+class StrWrapper(ValueWrapper):
     """
     Naive str wrapper that doesn't use the monkey-patched pypika ValueWrapper for MySQL
     """
 
-    def get_value_sql(self, **kwargs):
-        quote_char = kwargs.get("secondary_quote_char") or ""
+    def get_value_sql(self, ctx: SqlContext) -> str:
+        quote_char = ctx.secondary_quote_char or ""
         value = self.value.replace(quote_char, quote_char * 2)
         return format_quotes(value, quote_char)
 
 
 def escape_like(val: str) -> str:
-    return val.replace("\\", "\\\\\\\\").replace("%", "\\%").replace("_", "\\_")
+    return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _mysql_like(field: Term, pattern: str) -> Criterion:
+    return Like(Cast(field, SqlTypes.CHAR), StrWrapper(pattern), escape="")
+
+
+def _mysql_upper_like(field: Term, pattern: str) -> Criterion:
+    return Like(Upper(Cast(field, SqlTypes.CHAR)), Upper(StrWrapper(pattern)), escape="")
 
 
 def mysql_contains(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Cast(field, SqlTypes.CHAR), StrWrapper(f"%{escape_like(value)}%"), escape=""
-    )
+    return _mysql_like(field, f"%{escape_like(value)}%")
 
 
 def mysql_starts_with(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Cast(field, SqlTypes.CHAR), StrWrapper(f"{escape_like(value)}%"), escape=""
-    )
+    return _mysql_like(field, f"{escape_like(value)}%")
 
 
 def mysql_ends_with(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Cast(field, SqlTypes.CHAR), StrWrapper(f"%{escape_like(value)}"), escape=""
-    )
+    return _mysql_like(field, f"%{escape_like(value)}")
 
 
 def mysql_insensitive_exact(field: Term, value: str) -> Criterion:
-    return functions.Upper(functions.Cast(field, SqlTypes.CHAR)).eq(functions.Upper(str(value)))
+    return Upper(Cast(field, SqlTypes.CHAR)).eq(Upper(str(value)))
 
 
 def mysql_insensitive_contains(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Upper(functions.Cast(field, SqlTypes.CHAR)),
-        functions.Upper(StrWrapper(f"%{escape_like(value)}%")),
-        escape="",
-    )
+    return _mysql_upper_like(field, f"%{escape_like(value)}%")
 
 
 def mysql_insensitive_starts_with(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Upper(functions.Cast(field, SqlTypes.CHAR)),
-        functions.Upper(StrWrapper(f"{escape_like(value)}%")),
-        escape="",
-    )
+    return _mysql_upper_like(field, f"{escape_like(value)}%")
 
 
 def mysql_insensitive_ends_with(field: Term, value: str) -> Criterion:
-    return Like(
-        functions.Upper(functions.Cast(field, SqlTypes.CHAR)),
-        functions.Upper(StrWrapper(f"%{escape_like(value)}")),
-        escape="",
-    )
+    return _mysql_upper_like(field, f"%{escape_like(value)}")
 
 
-def mysql_search(field: Term, value: str):
+def mysql_search(field: Term, value: str) -> SearchCriterion:
     return SearchCriterion(field, expr=StrWrapper(value))
+
+
+def mysql_posix_regex(field: Term, value: str) -> BasicCriterion:
+    return BasicCriterion(
+        MySQLRegexpComparators.REGEXP, Coalesce(Cast(field, SqlTypes.CHAR)), StrWrapper(value)
+    )
 
 
 class MySQLExecutor(BaseExecutor):
@@ -108,19 +112,39 @@ class MySQLExecutor(BaseExecutor):
         json_contains: mysql_json_contains,
         json_contained_by: mysql_json_contained_by,
         json_filter: mysql_json_filter,
+        posix_regex: mysql_posix_regex,
     }
-    EXPLAIN_PREFIX = "EXPLAIN FORMAT=JSON"
+    EXPLAIN_SUPPORTED_FORMATS = ["JSON", "TRADITIONAL", "TREE"]
 
-    def parameter(self, pos: int) -> Parameter:
-        return Parameter("%s")
+    async def execute_explain(
+        self, sql: str, output_fmt: str | None = None, **options: bool
+    ) -> Any:
+        output_fmt = output_fmt or "JSON"
+        if output_fmt.upper() not in self.EXPLAIN_SUPPORTED_FORMATS:
+            raise UnSupportedError(f"Unsupported explain format: {output_fmt}")
+
+        if options and not all(k == "analyze" for k in options):
+            unsupported = [k for k in options if k != "analyze"]
+            raise UnSupportedError(f"Unsupported options: {set(unsupported)}")
+
+        explain_parts = []
+        if options.get("analyze"):
+            explain_parts.append("ANALYZE")
+        explain_parts.append(f"FORMAT={output_fmt.upper()}")
+
+        explain_statement = "EXPLAIN " + " ".join(explain_parts)
+        return (await self.db.execute_query(f"{explain_statement} {sql}"))[1]
 
     async def _process_insert_result(self, instance: Model, results: int) -> None:
         pk_field_object = self.model._meta.pk
         if (
             isinstance(pk_field_object, (SmallIntField, IntField, BigIntField))
             and pk_field_object.generated
+            and not instance._custom_generated_pk
         ):
             instance.pk = results
+        if self.model._meta.db_default_db_columns:
+            await self._fetch_db_defaults_after_insert(instance)
 
         # MySQL can only generate a single ROWID
         #   so if any other primary key, it won't generate what we want.

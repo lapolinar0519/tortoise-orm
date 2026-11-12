@@ -12,10 +12,12 @@ Reference
    timezone
    schema
    query
+   direct_queries
    manager
    functions
    expressions
    transactions
+   connections
    exceptions
    signals
    migration

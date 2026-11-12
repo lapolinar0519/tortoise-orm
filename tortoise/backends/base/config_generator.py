@@ -1,22 +1,53 @@
+from __future__ import annotations
+
+import re
 import urllib.parse as urlparse
 import uuid
+from collections.abc import Iterable
 from types import ModuleType
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Final
 
 from tortoise.exceptions import ConfigurationError
 
 urlparse.uses_netloc.append("postgres")
+urlparse.uses_netloc.append("postgresql")
+urlparse.uses_netloc.append("asyncpg")
+urlparse.uses_netloc.append("psycopg")
 urlparse.uses_netloc.append("sqlite")
 urlparse.uses_netloc.append("mysql")
-DB_LOOKUP: Dict[str, Dict[str, Any]] = {
-    "postgres": {
+urlparse.uses_netloc.append("oracle")
+urlparse.uses_netloc.append("mssql")
+DB_LOOKUP: Final[dict[str, dict[str, Any]]] = {
+    "psycopg": {
+        "engine": "tortoise.backends.psycopg",
+        "vmap": {
+            "path": "database",
+            "hostname": "host",
+            "port": "port",
+            "username": "user",
+            "password": "password",  # nosec:B105
+        },
+        "defaults": {"port": 5432},
+        "cast": {
+            "min_size": int,
+            "max_size": int,
+            "max_queries": int,
+            "max_inactive_connection_lifetime": float,
+            "timeout": int,
+            "statement_cache_size": int,
+            "max_cached_statement_lifetime": int,
+            "max_cacheable_statement_size": int,
+            "ssl": bool,
+        },
+    },
+    "asyncpg": {
         "engine": "tortoise.backends.asyncpg",
         "vmap": {
             "path": "database",
             "hostname": "host",
             "port": "port",
             "username": "user",
-            "password": "password",
+            "password": "password",  # nosec:B105
         },
         "defaults": {"port": 5432},
         "cast": {
@@ -36,7 +67,10 @@ DB_LOOKUP: Dict[str, Dict[str, Any]] = {
         "skip_first_char": False,
         "vmap": {"path": "file_path"},
         "defaults": {"journal_mode": "WAL", "journal_size_limit": 16384},
-        "cast": {"journal_size_limit": int},
+        "cast": {
+            "journal_size_limit": int,
+            "install_regexp_functions": bool,
+        },
     },
     "mysql": {
         "engine": "tortoise.backends.mysql",
@@ -45,30 +79,153 @@ DB_LOOKUP: Dict[str, Dict[str, Any]] = {
             "hostname": "host",
             "port": "port",
             "username": "user",
-            "password": "password",
+            "password": "password",  # nosec:B105
         },
         "defaults": {"port": 3306, "charset": "utf8mb4", "sql_mode": "STRICT_TRANS_TABLES"},
+        "allow_blank": {"sql_mode"},
         "cast": {
             "minsize": int,
             "maxsize": int,
             "connect_timeout": float,
             "echo": bool,
-            "no_delay": bool,
             "use_unicode": bool,
+            "pool_recycle": int,
+            "ssl": bool,
+        },
+    },
+    "mssql": {
+        "engine": "tortoise.backends.mssql",
+        "vmap": {
+            "path": "database",
+            "hostname": "host",
+            "port": "port",
+            "username": "user",
+            "password": "password",  # nosec:B105
+        },
+        "defaults": {"port": 1433},
+        "cast": {
+            "minsize": int,
+            "maxsize": int,
+            "echo": bool,
+            "pool_recycle": int,
+        },
+    },
+    "oracle": {
+        "engine": "tortoise.backends.oracle",
+        "vmap": {
+            "path": "database",
+            "hostname": "host",
+            "port": "port",
+            "username": "user",
+            "password": "password",  # nosec:B105
+        },
+        "defaults": {"port": 1521},
+        "cast": {
+            "minsize": int,
+            "maxsize": int,
+            "echo": bool,
+            "pool_recycle": int,
         },
     },
 }
+# Create an alias "postgres" for backwards compatibility
+# "postgresql" is the scheme accepted by libpq and pydantic's PostgresDsn
+DB_LOOKUP["postgres"] = DB_LOOKUP["postgresql"] = DB_LOOKUP["asyncpg"]
+
+
+def _quote_url_userinfo(db_url: str) -> str:
+    """Encode characters in the userinfo section that break urlparse.
+
+    Specifically, '[' and ']' cause urlparse to fail with a ValueError because
+    it interprets them as IPv6 address brackets. This encodes only those characters,
+    leaving everything else (including '%') untouched.
+    """
+    scheme_end = db_url.find("://")
+    if scheme_end == -1:
+        return db_url
+
+    scheme = db_url[: scheme_end + 3]
+    rest = db_url[scheme_end + 3 :]
+
+    at_pos = rest.find("@")
+    if at_pos == -1:
+        return db_url
+
+    userinfo = rest[:at_pos]
+    after_userinfo = rest[at_pos:]
+
+    colon_pos = userinfo.find(":")
+    if colon_pos == -1:
+        username = userinfo.replace("[", "%5B").replace("]", "%5D")
+        return scheme + username + after_userinfo
+
+    username = userinfo[:colon_pos]
+    password = userinfo[colon_pos + 1 :]
+    username_quoted = username.replace("[", "%5B").replace("]", "%5D")
+    password_quoted = password.replace("[", "%5B").replace("]", "%5D")
+    return scheme + username_quoted + ":" + password_quoted + after_userinfo
+
+
+_MULTI_HOST_BACKENDS = {"postgres", "postgresql", "asyncpg", "psycopg"}
+
+
+def _split_multi_host(hostinfo: str) -> tuple[list[str], list[int | None]]:
+    """Split the host part of a libpq style multi-host URL, ``h1:5432,h2:5433``.
+
+    A host without a port gets None as its port.
+    """
+    hosts: list[str] = []
+    ports: list[int | None] = []
+    for entry in hostinfo.split(","):
+        host, sep, port = entry.rpartition(":")
+        if not sep or host.endswith(":") or (entry.startswith("[") and not host.endswith("]")):
+            # No port: a bare host, or an IPv6 literal whose colons belong to the address
+            host, port = entry, ""
+        host = host.strip().strip("[]").strip().lower()
+        if not host:
+            raise ConfigurationError("Empty host in multi-host DB_URL")
+        try:
+            number = int(port) if port.strip() else None
+        except ValueError as e:
+            raise ConfigurationError("Port is not an integer") from e
+        if number is not None and not 1 <= number <= 65535:
+            raise ConfigurationError("Port must be between 1 and 65535")
+        hosts.append(host)
+        ports.append(number)
+    return hosts, ports
+
+
+def _parse_query_value(db: dict, key: str, val: list[str]) -> Any:
+    last_value = val[-1]
+    db_cast = db["cast"].get(key, str)
+    if db_cast is bool:
+        return last_value.lower() in ("true", "1", "yes", "on")
+    return db_cast(last_value)
 
 
 def expand_db_url(db_url: str, testing: bool = False) -> dict:
+    # Quote special characters in userinfo to avoid parsing errors
+    db_url = _quote_url_userinfo(db_url)
+    multi_host: tuple[list[str], list[int | None]] | None = None
+    scheme, sep, rest = db_url.partition("://")
+    if sep and scheme.lower() in _MULTI_HOST_BACKENDS:
+        # urlparse cannot read several hosts (IPv6 brackets raise), so cut them out first
+        m = re.match(r"([^/?#]*)(.*)", rest, re.DOTALL)
+        if m is None:  # pragma: no cover - pattern always matches
+            raise ConfigurationError(f"Failed to parse multi-host URL: {db_url!r}")
+        netloc, tail = m.groups()
+        userinfo, at, hostinfo = netloc.rpartition("@")
+        if "," in hostinfo:
+            multi_host = _split_multi_host(hostinfo)
+            db_url = f"{scheme}://{userinfo}{at}multi-host{tail}"
     url = urlparse.urlparse(db_url)
-    if url.scheme not in DB_LOOKUP:
-        raise ConfigurationError(f"Unknown DB scheme: {url.scheme}")
-
     db_backend = url.scheme
-    db = DB_LOOKUP[db_backend]
+    try:
+        db = DB_LOOKUP[db_backend]
+    except KeyError:
+        raise ConfigurationError(f"Unknown DB scheme: {db_backend}") from None
     if db.get("skip_first_char", True):
-        path: Optional[str] = url.path[1:]
+        path: str | None = url.path[1:]
     else:
         path = url.netloc + url.path
 
@@ -78,12 +235,18 @@ def expand_db_url(db_url: str, testing: bool = False) -> dict:
         # Other database backend accepts database name being None (but not empty string).
         path = None
 
-    params: dict = {}
-    for key, val in db["defaults"].items():
-        params[key] = val
-    for key, val in urlparse.parse_qs(url.query).items():
-        cast = db["cast"].get(key, str)
-        params[key] = cast(val[-1])
+    params = dict(db["defaults"])
+    if allow_blank := db.get("allow_blank", ()):
+        for key, val in urlparse.parse_qs(url.query, keep_blank_values=True).items():
+            # Only keep blank values that are explicitly supported by the backend.
+            if key not in allow_blank:
+                val = [value for value in val if value]
+                if not val:
+                    continue
+            params[key] = _parse_query_value(db, key, val)
+    else:
+        for key, val in urlparse.parse_qs(url.query).items():
+            params[key] = _parse_query_value(db, key, val)
 
     if testing and path:
         path = path.replace("\\{", "{").replace("\\}", "}")
@@ -92,23 +255,38 @@ def expand_db_url(db_url: str, testing: bool = False) -> dict:
     vmap: dict = {}
     vmap.update(db["vmap"])
     params[vmap["path"]] = path
-    if vmap.get("hostname"):
-        params[vmap["hostname"]] = url.hostname or None
-    try:
-        if vmap.get("port") and url.port:
-            params[vmap["port"]] = int(url.port)
-    except ValueError:
-        raise ConfigurationError("Port is not an integer")
-    if vmap.get("username"):
+    if multi_host:
+        # libpq style failover list: several hosts, each with its own port,
+        # a host without one takes the port set in the query string or the default
+        hosts, ports = multi_host
+        try:
+            default_port = int(params[vmap["port"]])
+        except ValueError as e:
+            raise ConfigurationError("Port is not an integer") from e
+        params[vmap["hostname"]] = hosts
+        params[vmap["port"]] = [default_port if p is None else p for p in ports]
+    else:
+        if host_key := vmap.get("hostname"):
+            if url.hostname:
+                params[host_key] = url.hostname
+            elif host_key not in params:
+                # Keep a host given in the query string (e.g. a unix socket directory)
+                params[host_key] = None
+        try:
+            if vmap.get("port") and url.port:
+                params[vmap["port"]] = int(url.port)
+        except ValueError as e:
+            raise ConfigurationError("Port is not an integer") from e
+    if vmap.get("username") and (url.username or vmap["username"] not in params):
         # Pass username as None, instead of empty string,
-        # to let asyncpg retrieve username from evionment variable or OS user
-        params[vmap["username"]] = url.username or None
-    if vmap.get("password"):
+        # to let asyncpg retrieve username from environment variable or OS user
+        params[vmap["username"]] = urlparse.unquote(url.username) if url.username else None
+    if vmap.get("password") and (url.password or vmap["password"] not in params):
         # asyncpg accepts None for password, but aiomysql not
         params[vmap["password"]] = (
             None
-            if (not url.password and db_backend == "postgres")
-            else urlparse.unquote_plus(url.password or "")
+            if (not url.password and db_backend in {"postgres", "postgresql", "asyncpg", "psycopg"})
+            else urlparse.unquote(url.password or "")
         )
 
     return {"engine": db["engine"], "credentials": params}
@@ -116,8 +294,8 @@ def expand_db_url(db_url: str, testing: bool = False) -> dict:
 
 def generate_config(
     db_url: str,
-    app_modules: Dict[str, Iterable[Union[str, ModuleType]]],
-    connection_label: Optional[str] = None,
+    app_modules: dict[str, Iterable[str | ModuleType]],
+    connection_label: str | None = None,
     testing: bool = False,
 ) -> dict:
     _connection_label = connection_label or "default"

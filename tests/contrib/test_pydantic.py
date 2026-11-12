@@ -1,1292 +1,2438 @@
 import copy
+from typing import Annotated, Any, Literal, get_args
 
-from tests.testmodels import Address, Employee, Event, JSONFields, Reporter, Team, Tournament
-from tortoise.contrib import test
-from tortoise.contrib.pydantic import pydantic_model_creator, pydantic_queryset_creator
+import pytest
+import pytest_asyncio
+from pydantic import ConfigDict, ValidationError, field_validator
+
+from tests.testmodels import (
+    Address,
+    CamelCaseAliasPerson,
+    Employee,
+    EnumFields,
+    Event,
+    IntFields,
+    JSONFields,
+    ModelTestPydanticMetaBackwardRelations1,
+    ModelTestPydanticMetaBackwardRelations2,
+    Reporter,
+    Team,
+    Tournament,
+    User,
+    json_pydantic_default,
+)
+from tortoise import fields
+from tortoise.contrib.pydantic import (
+    PydanticModel,
+    pydantic_model_creator,
+    pydantic_queryset_creator,
+)
+from tortoise.models import Model
+from tortoise.validators import RegexValidator
 
 
-class TestPydantic(test.TestCase):
-    async def setUp(self) -> None:
-        self.Event_Pydantic = pydantic_model_creator(Event)
-        self.Event_Pydantic_List = pydantic_queryset_creator(Event)
-        self.Tournament_Pydantic = pydantic_model_creator(Tournament)
-        self.Team_Pydantic = pydantic_model_creator(Team)
-        self.Address_Pydantic = pydantic_model_creator(Address)
+# Fixtures for TestPydantic
+@pytest_asyncio.fixture
+async def pydantic_setup(db):
+    """Setup for pydantic tests with models and data."""
+    Event_Pydantic = pydantic_model_creator(Event)
+    Event_Pydantic_List = pydantic_queryset_creator(Event)
+    Tournament_Pydantic = pydantic_model_creator(Tournament)
+    Team_Pydantic = pydantic_model_creator(Team)
+    Address_Pydantic = pydantic_model_creator(Address)
+    ModelTestPydanticMetaBackwardRelations1_Pydantic = pydantic_model_creator(
+        ModelTestPydanticMetaBackwardRelations1
+    )
+    ModelTestPydanticMetaBackwardRelations2_Pydantic = pydantic_model_creator(
+        ModelTestPydanticMetaBackwardRelations2
+    )
 
-        class PydanticMetaOverride:
-            backward_relations = False
+    class PydanticMetaOverride:
+        backward_relations = False
 
-        self.Event_Pydantic_non_backward = pydantic_model_creator(
-            Event, meta_override=PydanticMetaOverride, name="Event_non_backward"
-        )
+    Event_Pydantic_non_backward_from_override = pydantic_model_creator(
+        Event, meta_override=PydanticMetaOverride, name="Event_non_backward"
+    )
 
-        self.tournament = await Tournament.create(name="New Tournament")
-        self.reporter = await Reporter.create(name="The Reporter")
-        self.event = await Event.create(
-            name="Test", tournament=self.tournament, reporter=self.reporter
-        )
-        self.event2 = await Event.create(name="Test2", tournament=self.tournament)
-        self.address = await Address.create(city="Santa Monica", street="Ocean", event=self.event)
-        self.team1 = await Team.create(name="Onesies")
-        self.team2 = await Team.create(name="T-Shirts")
-        await self.event.participants.add(self.team1, self.team2)
-        await self.event2.participants.add(self.team1, self.team2)
-        self.maxDiff = None
+    tournament = await Tournament.create(name="New Tournament")
+    reporter = await Reporter.create(name="The Reporter")
+    event = await Event.create(name="Test", tournament=tournament, reporter=reporter)
+    event2 = await Event.create(name="Test2", tournament=tournament)
+    address = await Address.create(city="Santa Monica", street="Ocean", event=event)
+    team1 = await Team.create(name="Onesies")
+    team2 = await Team.create(name="T-Shirts")
+    await event.participants.add(team1, team2)
+    await event2.participants.add(team1, team2)
 
-    async def test_backward_relations(self):
-        event_schema = copy.deepcopy(dict(self.Event_Pydantic.schema()))
-        event_non_backward_schema = copy.deepcopy(dict(self.Event_Pydantic_non_backward.schema()))
-        self.assertTrue("address" in event_schema["properties"])
-        self.assertFalse("address" in event_non_backward_schema["properties"])
-        del event_schema["properties"]["address"]
-        self.assertEqual(event_schema["properties"], event_non_backward_schema["properties"])
+    return {
+        "Event_Pydantic": Event_Pydantic,
+        "Event_Pydantic_List": Event_Pydantic_List,
+        "Tournament_Pydantic": Tournament_Pydantic,
+        "Team_Pydantic": Team_Pydantic,
+        "Address_Pydantic": Address_Pydantic,
+        "ModelTestPydanticMetaBackwardRelations1_Pydantic": ModelTestPydanticMetaBackwardRelations1_Pydantic,
+        "ModelTestPydanticMetaBackwardRelations2_Pydantic": ModelTestPydanticMetaBackwardRelations2_Pydantic,
+        "Event_Pydantic_non_backward_from_override": Event_Pydantic_non_backward_from_override,
+        "tournament": tournament,
+        "reporter": reporter,
+        "event": event,
+        "event2": event2,
+        "address": address,
+        "team1": team1,
+        "team2": team2,
+    }
 
-    def test_event_schema(self):
-        self.assertEqual(
-            self.Event_Pydantic.schema(),
-            {
-                "title": "Event",
-                "description": "Events on the calendar",
-                "type": "object",
+
+@pytest.mark.asyncio
+async def test_backward_relations_with_meta_override(db, pydantic_setup):
+    Event_Pydantic = pydantic_setup["Event_Pydantic"]
+    Event_Pydantic_non_backward_from_override = pydantic_setup[
+        "Event_Pydantic_non_backward_from_override"
+    ]
+
+    event_schema = copy.deepcopy(dict(Event_Pydantic.model_json_schema()))
+    event_non_backward_schema_by_override = copy.deepcopy(
+        dict(Event_Pydantic_non_backward_from_override.model_json_schema())
+    )
+    assert "address" in event_schema["properties"]
+    assert "address" not in event_non_backward_schema_by_override["properties"]
+    del event_schema["properties"]["address"]
+    assert event_schema["properties"] == event_non_backward_schema_by_override["properties"]
+
+
+@pytest.mark.asyncio
+async def test_root_meta_override_limits_pydantic_recursion(db):
+    class PydanticMetaOverrideNoRelations:
+        max_recursion = 0
+
+    class PydanticMetaOverride:
+        max_recursion = 1
+
+    flat_model = pydantic_model_creator(Tournament, meta_override=PydanticMetaOverrideNoRelations)
+    tournament_model = pydantic_model_creator(Tournament, meta_override=PydanticMetaOverride)
+    event_model = get_args(tournament_model.model_fields["events"].annotation)[0]
+
+    assert "events" not in flat_model.model_fields
+    assert "name" in event_model.model_fields
+    assert "participants" not in event_model.model_fields
+
+
+@pytest.mark.asyncio
+async def test_nested_pydantic_recursion_limit_is_preserved(db, monkeypatch):
+    class PydanticMeta:
+        max_recursion = 1
+
+    monkeypatch.setattr(Event, "PydanticMeta", PydanticMeta, raising=False)
+    tournament_model = pydantic_model_creator(Tournament)
+    event_model = get_args(tournament_model.model_fields["events"].annotation)[0]
+
+    assert "name" in event_model.model_fields
+    assert "participants" not in event_model.model_fields
+
+
+@pytest.mark.asyncio
+async def test_backward_relations_with_pydantic_meta(db, pydantic_setup):
+    ModelTestPydanticMetaBackwardRelations1_Pydantic = pydantic_setup[
+        "ModelTestPydanticMetaBackwardRelations1_Pydantic"
+    ]
+    ModelTestPydanticMetaBackwardRelations2_Pydantic = pydantic_setup[
+        "ModelTestPydanticMetaBackwardRelations2_Pydantic"
+    ]
+
+    test_model1_schema = ModelTestPydanticMetaBackwardRelations1_Pydantic.model_json_schema()
+    test_model2_schema = ModelTestPydanticMetaBackwardRelations2_Pydantic.model_json_schema()
+    assert "threes" in test_model2_schema["properties"]
+    assert "threes" not in test_model1_schema["properties"]
+    del test_model2_schema["properties"]["threes"]
+    assert test_model2_schema["properties"] == test_model1_schema["properties"]
+    print(test_model2_schema)
+
+
+@pytest.mark.asyncio
+async def test_backward_relations_annotated_kept(db):
+    """backward_relations=False should keep explicitly annotated ReverseRelation fields."""
+    from tests.testmodels import ModelTestPydanticAnnotatedBackwardRel
+
+    Pydantic = pydantic_model_creator(ModelTestPydanticAnnotatedBackwardRel)
+    schema = Pydantic.model_json_schema()
+    # Annotated backward relation should be included
+    assert "annotated_children" in schema["properties"]
+    # Unannotated backward relation should be excluded
+    assert "unannotated_children" not in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_event_schema(db, pydantic_setup):
+    Event_Pydantic = pydantic_setup["Event_Pydantic"]
+    assert Event_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Address_zwygvk_leaf": {
+                "additionalProperties": False,
                 "properties": {
+                    "city": {"maxLength": 64, "title": "City", "type": "string"},
+                    "street": {"maxLength": 128, "title": "Street", "type": "string"},
+                    "m2mwitho2opks": {
+                        "items": {"$ref": "#/$defs/M2mWithO2oPk_zpacbp_leaf"},
+                        "title": "M2Mwitho2Opks",
+                        "type": "array",
+                    },
                     "event_id": {
-                        "title": "Event Id",
-                        "minimum": 1,
                         "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
                         "type": "integer",
                     },
-                    "name": {"title": "Name", "description": "The name", "type": "string"},
+                },
+                "required": ["city", "street", "event_id", "m2mwitho2opks"],
+                "title": "Address",
+                "type": "object",
+            },
+            "M2mWithO2oPk_zpacbp_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 64, "title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "M2mWithO2oPk",
+                "type": "object",
+            },
+            "Reporter_ifqfo2_leaf": {
+                "additionalProperties": False,
+                "description": "Whom is assigned as the reporter",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "Reporter",
+                "type": "object",
+            },
+            "Team_fcszy2_leaf": {
+                "additionalProperties": False,
+                "description": "Team that is a playing",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
+                    },
+                },
+                "required": ["id", "name"],
+                "title": "Team",
+                "type": "object",
+            },
+            "Tournament_zh4alg_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 32767,
+                        "minimum": -32768,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 255, "title": "Name", "type": "string"},
+                    "desc": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Desc",
+                    },
+                    "created": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Created",
+                        "type": "string",
+                    },
+                },
+                "required": ["id", "name", "created"],
+                "title": "Tournament",
+                "type": "object",
+            },
+        },
+        "additionalProperties": False,
+        "description": "Events on the calendar",
+        "properties": {
+            "event_id": {
+                "maximum": 9223372036854775807,
+                "minimum": -9223372036854775808,
+                "title": "Event Id",
+                "type": "integer",
+            },
+            "name": {"description": "The name", "title": "Name", "type": "string"},
+            "tournament": {
+                "$ref": "#/$defs/Tournament_zh4alg_leaf",
+                "description": "What tournaments is a happenin'",
+            },
+            "reporter": {
+                "anyOf": [
+                    {"$ref": "#/$defs/Reporter_ifqfo2_leaf"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Reporter",
+            },
+            "participants": {
+                "items": {"$ref": "#/$defs/Team_fcszy2_leaf"},
+                "title": "Participants",
+                "type": "array",
+            },
+            "modified": {
+                "format": "date-time",
+                "readOnly": True,
+                "title": "Modified",
+                "type": "string",
+            },
+            "token": {"title": "Token", "type": "string"},
+            "alias": {
+                "anyOf": [
+                    {"maximum": 2147483647, "minimum": -2147483648, "type": "integer"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Alias",
+            },
+            "address": {
+                "anyOf": [
+                    {"$ref": "#/$defs/Address_zwygvk_leaf"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Address",
+            },
+        },
+        "required": [
+            "event_id",
+            "name",
+            "tournament",
+            "participants",
+            "modified",
+            "token",
+        ],
+        "title": "Event",
+        "type": "object",
+    }
+
+
+@pytest.mark.asyncio
+async def test_eventlist_schema(db, pydantic_setup):
+    Event_Pydantic_List = pydantic_setup["Event_Pydantic_List"]
+    assert Event_Pydantic_List.model_json_schema() == {
+        "$defs": {
+            "Event_rgfzbr": {
+                "additionalProperties": False,
+                "description": "Events on the calendar",
+                "properties": {
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
+                    },
+                    "name": {"description": "The name", "title": "Name", "type": "string"},
                     "tournament": {
-                        "title": "Tournament",
+                        "$ref": "#/$defs/Tournament_zh4alg_leaf",
                         "description": "What tournaments is a happenin'",
-                        "allOf": [{"$ref": "#/definitions/tests.testmodels.Tournament.leaf"}],
                     },
                     "reporter": {
-                        "title": "Reporter",
+                        "anyOf": [
+                            {"$ref": "#/$defs/Reporter_ifqfo2_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
                         "nullable": True,
-                        "allOf": [{"$ref": "#/definitions/tests.testmodels.Reporter.leaf"}],
+                        "title": "Reporter",
                     },
                     "participants": {
+                        "items": {"$ref": "#/$defs/Team_fcszy2_leaf"},
                         "title": "Participants",
                         "type": "array",
-                        "items": {"$ref": "#/definitions/tests.testmodels.Team.leaf"},
                     },
                     "modified": {
-                        "title": "Modified",
-                        "readOnly": True,
-                        "type": "string",
                         "format": "date-time",
+                        "readOnly": True,
+                        "title": "Modified",
+                        "type": "string",
                     },
                     "token": {"title": "Token", "type": "string"},
                     "alias": {
-                        "title": "Alias",
-                        "minimum": -2147483648,
-                        "maximum": 2147483647,
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
                         "nullable": True,
-                        "type": "integer",
+                        "title": "Alias",
                     },
                     "address": {
-                        "title": "Address",
+                        "anyOf": [
+                            {"$ref": "#/$defs/Address_zwygvk_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
                         "nullable": True,
-                        "allOf": [{"$ref": "#/definitions/tests.testmodels.Address.leaf"}],
-                    },
-                },
-                "required": ["event_id", "name", "tournament", "participants", "modified"],
-                "additionalProperties": False,
-                "definitions": {
-                    "tests.testmodels.Tournament.leaf": {
-                        "title": "Tournament",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 32767,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 255, "type": "string"},
-                            "desc": {"title": "Desc", "nullable": True, "type": "string"},
-                            "created": {
-                                "title": "Created",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                        },
-                        "required": ["id", "name", "created"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Reporter.leaf": {
-                        "title": "Reporter",
-                        "description": "Whom is assigned as the reporter",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Team.leaf": {
-                        "title": "Team",
-                        "description": "Team that is a playing",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Address.leaf": {
                         "title": "Address",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "city": {"title": "City", "maxLength": 64, "type": "string"},
-                            "street": {"title": "Street", "maxLength": 128, "type": "string"},
-                        },
-                        "required": ["city", "street", "event_id"],
-                        "additionalProperties": False,
                     },
                 },
-            },
-        )
-
-    def test_eventlist_schema(self):
-        self.assertEqual(
-            self.Event_Pydantic_List.schema(),
-            {
-                "title": "Event_list",
-                "description": "Events on the calendar",
-                "type": "array",
-                "items": {"$ref": "#/definitions/tests.testmodels.Event"},
-                "definitions": {
-                    "tests.testmodels.Tournament.leaf": {
-                        "title": "Tournament",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 32767,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 255, "type": "string"},
-                            "desc": {"title": "Desc", "nullable": True, "type": "string"},
-                            "created": {
-                                "title": "Created",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                        },
-                        "required": ["id", "name", "created"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Reporter.leaf": {
-                        "title": "Reporter",
-                        "description": "Whom is assigned as the reporter",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Team.leaf": {
-                        "title": "Team",
-                        "description": "Team that is a playing",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Address.leaf": {
-                        "title": "Address",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "city": {"title": "City", "maxLength": 64, "type": "string"},
-                            "street": {"title": "Street", "maxLength": 128, "type": "string"},
-                        },
-                        "required": ["city", "street", "event_id"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Event": {
-                        "title": "Event",
-                        "description": "Events on the calendar",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "description": "The name", "type": "string"},
-                            "tournament": {
-                                "title": "Tournament",
-                                "description": "What tournaments is a happenin'",
-                                "allOf": [
-                                    {"$ref": "#/definitions/tests.testmodels.Tournament.leaf"}
-                                ],
-                            },
-                            "reporter": {
-                                "title": "Reporter",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Reporter.leaf"}],
-                            },
-                            "participants": {
-                                "title": "Participants",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Team.leaf"},
-                            },
-                            "modified": {
-                                "title": "Modified",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                            "token": {"title": "Token", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                            "address": {
-                                "title": "Address",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Address.leaf"}],
-                            },
-                        },
-                        "required": ["event_id", "name", "tournament", "participants", "modified"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-        )
-
-    def test_address_schema(self):
-        self.assertEqual(
-            self.Address_Pydantic.schema(),
-            {
-                "title": "Address",
+                "required": [
+                    "event_id",
+                    "name",
+                    "tournament",
+                    "participants",
+                    "modified",
+                    "token",
+                ],
+                "title": "Event",
                 "type": "object",
+            },
+            "Address_zwygvk_leaf": {
+                "additionalProperties": False,
                 "properties": {
-                    "city": {"title": "City", "maxLength": 64, "type": "string"},
-                    "street": {"title": "Street", "maxLength": 128, "type": "string"},
-                    "event": {
-                        "title": "Event",
-                        "allOf": [{"$ref": "#/definitions/tests.testmodels.Event.orhjcw"}],
+                    "city": {"maxLength": 64, "title": "City", "type": "string"},
+                    "street": {"maxLength": 128, "title": "Street", "type": "string"},
+                    "m2mwitho2opks": {
+                        "items": {"$ref": "#/$defs/M2mWithO2oPk_zpacbp_leaf"},
+                        "title": "M2Mwitho2Opks",
+                        "type": "array",
                     },
                     "event_id": {
-                        "title": "Event Id",
-                        "minimum": 1,
                         "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
                         "type": "integer",
                     },
                 },
-                "required": ["city", "street", "event", "event_id"],
-                "additionalProperties": False,
-                "definitions": {
-                    "tests.testmodels.Tournament.leaf": {
-                        "title": "Tournament",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 32767,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 255, "type": "string"},
-                            "desc": {"title": "Desc", "nullable": True, "type": "string"},
-                            "created": {
-                                "title": "Created",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                        },
-                        "required": ["id", "name", "created"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Reporter.leaf": {
-                        "title": "Reporter",
-                        "description": "Whom is assigned as the reporter",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Team.leaf": {
-                        "title": "Team",
-                        "description": "Team that is a playing",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Event.orhjcw": {
-                        "title": "Event",
-                        "description": "Events on the calendar",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "description": "The name", "type": "string"},
-                            "tournament": {
-                                "title": "Tournament",
-                                "description": "What tournaments is a happenin'",
-                                "allOf": [
-                                    {"$ref": "#/definitions/tests.testmodels.Tournament.leaf"}
-                                ],
-                            },
-                            "reporter": {
-                                "title": "Reporter",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Reporter.leaf"}],
-                            },
-                            "participants": {
-                                "title": "Participants",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Team.leaf"},
-                            },
-                            "modified": {
-                                "title": "Modified",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                            "token": {"title": "Token", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["event_id", "name", "tournament", "participants", "modified"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-        )
-
-    def test_tournament_schema(self):
-        self.assertEqual(
-            self.Tournament_Pydantic.schema(),
-            {
-                "title": "Tournament",
+                "required": ["city", "street", "event_id", "m2mwitho2opks"],
+                "title": "Address",
                 "type": "object",
-                "properties": {
-                    "id": {"title": "Id", "minimum": 1, "maximum": 32767, "type": "integer"},
-                    "name": {"title": "Name", "maxLength": 255, "type": "string"},
-                    "desc": {"title": "Desc", "nullable": True, "type": "string"},
-                    "created": {
-                        "title": "Created",
-                        "readOnly": True,
-                        "type": "string",
-                        "format": "date-time",
-                    },
-                    "events": {
-                        "title": "Events",
-                        "description": "What tournaments is a happenin'",
-                        "type": "array",
-                        "items": {"$ref": "#/definitions/tests.testmodels.Event.b4oydv"},
-                    },
-                },
-                "required": ["id", "name", "created", "events"],
-                "additionalProperties": False,
-                "definitions": {
-                    "tests.testmodels.Reporter.leaf": {
-                        "title": "Reporter",
-                        "description": "Whom is assigned as the reporter",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Team.leaf": {
-                        "title": "Team",
-                        "description": "Team that is a playing",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Address.leaf": {
-                        "title": "Address",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "city": {"title": "City", "maxLength": 64, "type": "string"},
-                            "street": {"title": "Street", "maxLength": 128, "type": "string"},
-                        },
-                        "required": ["city", "street", "event_id"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Event.b4oydv": {
-                        "title": "Event",
-                        "description": "Events on the calendar",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "description": "The name", "type": "string"},
-                            "reporter": {
-                                "title": "Reporter",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Reporter.leaf"}],
-                            },
-                            "participants": {
-                                "title": "Participants",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Team.leaf"},
-                            },
-                            "modified": {
-                                "title": "Modified",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                            "token": {"title": "Token", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
-                                "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                            "address": {
-                                "title": "Address",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Address.leaf"}],
-                            },
-                        },
-                        "required": ["event_id", "name", "participants", "modified"],
-                        "additionalProperties": False,
-                    },
-                },
             },
-        )
-
-    def test_team_schema(self):
-        self.assertEqual(
-            self.Team_Pydantic.schema(),
-            {
-                "title": "Team",
+            "M2mWithO2oPk_zpacbp_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 64, "title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "M2mWithO2oPk",
+                "type": "object",
+            },
+            "Reporter_ifqfo2_leaf": {
+                "additionalProperties": False,
+                "description": "Whom is assigned as the reporter",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "Reporter",
+                "type": "object",
+            },
+            "Team_fcszy2_leaf": {
+                "additionalProperties": False,
                 "description": "Team that is a playing",
-                "type": "object",
                 "properties": {
-                    "id": {"title": "Id", "minimum": 1, "maximum": 2147483647, "type": "integer"},
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
                     "name": {"title": "Name", "type": "string"},
                     "alias": {
-                        "title": "Alias",
-                        "minimum": -2147483648,
-                        "maximum": 2147483647,
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
                         "nullable": True,
+                        "title": "Alias",
+                    },
+                },
+                "required": ["id", "name"],
+                "title": "Team",
+                "type": "object",
+            },
+            "Tournament_zh4alg_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 32767,
+                        "minimum": -32768,
+                        "title": "Id",
                         "type": "integer",
                     },
-                    "events": {
-                        "title": "Events",
-                        "type": "array",
-                        "items": {"$ref": "#/definitions/tests.testmodels.Event.dlqoeq"},
+                    "name": {"maxLength": 255, "title": "Name", "type": "string"},
+                    "desc": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Desc",
+                    },
+                    "created": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Created",
+                        "type": "string",
                     },
                 },
-                "required": ["id", "name", "events"],
+                "required": ["id", "name", "created"],
+                "title": "Tournament",
+                "type": "object",
+            },
+        },
+        "description": "Events on the calendar",
+        "items": {"$ref": "#/$defs/Event_rgfzbr"},
+        "title": "Event_list",
+        "type": "array",
+    }
+
+
+@pytest.mark.asyncio
+async def test_address_schema(db, pydantic_setup):
+    Address_Pydantic = pydantic_setup["Address_Pydantic"]
+    assert Address_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Event_bhjepe_leaf": {
                 "additionalProperties": False,
-                "definitions": {
-                    "tests.testmodels.Tournament.leaf": {
-                        "title": "Tournament",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 32767,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 255, "type": "string"},
-                            "desc": {"title": "Desc", "nullable": True, "type": "string"},
-                            "created": {
-                                "title": "Created",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                        },
-                        "required": ["id", "name", "created"],
-                        "additionalProperties": False,
+                "description": "Events on the calendar",
+                "properties": {
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
                     },
-                    "tests.testmodels.Reporter.leaf": {
+                    "name": {"description": "The name", "title": "Name", "type": "string"},
+                    "tournament": {
+                        "$ref": "#/$defs/Tournament_zh4alg_leaf",
+                        "description": "What tournaments is a happenin'",
+                    },
+                    "reporter": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Reporter_ifqfo2_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
                         "title": "Reporter",
-                        "description": "Whom is assigned as the reporter",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
+                    },
+                    "participants": {
+                        "items": {"$ref": "#/$defs/Team_fcszy2_leaf"},
+                        "title": "Participants",
+                        "type": "array",
+                    },
+                    "modified": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Modified",
+                        "type": "string",
+                    },
+                    "token": {"title": "Token", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
                                 "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "type": "string"},
-                        },
-                        "required": ["id", "name"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Address.leaf": {
-                        "title": "Address",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "city": {"title": "City", "maxLength": 64, "type": "string"},
-                            "street": {"title": "Street", "maxLength": 128, "type": "string"},
-                        },
-                        "required": ["city", "street", "event_id"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Event.dlqoeq": {
-                        "title": "Event",
-                        "description": "Events on the calendar",
-                        "type": "object",
-                        "properties": {
-                            "event_id": {
-                                "title": "Event Id",
-                                "minimum": 1,
-                                "maximum": 9223372036854775807,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "description": "The name", "type": "string"},
-                            "tournament": {
-                                "title": "Tournament",
-                                "description": "What tournaments is a happenin'",
-                                "allOf": [
-                                    {"$ref": "#/definitions/tests.testmodels.Tournament.leaf"}
-                                ],
-                            },
-                            "reporter": {
-                                "title": "Reporter",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Reporter.leaf"}],
-                            },
-                            "modified": {
-                                "title": "Modified",
-                                "readOnly": True,
-                                "type": "string",
-                                "format": "date-time",
-                            },
-                            "token": {"title": "Token", "type": "string"},
-                            "alias": {
-                                "title": "Alias",
                                 "minimum": -2147483648,
-                                "maximum": 2147483647,
-                                "nullable": True,
                                 "type": "integer",
                             },
-                            "address": {
-                                "title": "Address",
-                                "nullable": True,
-                                "allOf": [{"$ref": "#/definitions/tests.testmodels.Address.leaf"}],
-                            },
-                        },
-                        "required": ["event_id", "name", "tournament", "modified"],
-                        "additionalProperties": False,
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
                     },
                 },
-            },
-        )
-
-    async def test_eventlist(self):
-        eventlp = await self.Event_Pydantic_List.from_queryset(Event.all())
-        # print(eventlp.json(indent=4))
-        eventldict = eventlp.dict()["__root__"]
-
-        # Remove timestamps
-        del eventldict[0]["modified"]
-        del eventldict[0]["tournament"]["created"]
-        del eventldict[1]["modified"]
-        del eventldict[1]["tournament"]["created"]
-
-        self.assertEqual(
-            eventldict,
-            [
-                {
-                    "event_id": self.event.event_id,
-                    "name": "Test",
-                    # "modified": "2020-01-28T10:43:50.901562",
-                    "token": self.event.token,
-                    "alias": None,
-                    "tournament": {
-                        "id": self.tournament.id,
-                        "name": "New Tournament",
-                        "desc": None,
-                        # "created": "2020-01-28T10:43:50.900664"
-                    },
-                    "reporter": {"id": self.reporter.id, "name": "The Reporter"},
-                    "participants": [
-                        {"id": self.team1.id, "name": "Onesies", "alias": None},
-                        {"id": self.team2.id, "name": "T-Shirts", "alias": None},
-                    ],
-                    "address": {
-                        "event_id": self.address.pk,
-                        "city": "Santa Monica",
-                        "street": "Ocean",
-                    },
-                },
-                {
-                    "event_id": self.event2.event_id,
-                    "name": "Test2",
-                    # "modified": "2020-01-28T10:43:50.901562",
-                    "token": self.event2.token,
-                    "alias": None,
-                    "tournament": {
-                        "id": self.tournament.id,
-                        "name": "New Tournament",
-                        "desc": None,
-                        # "created": "2020-01-28T10:43:50.900664"
-                    },
-                    "reporter": None,
-                    "participants": [
-                        {"id": self.team1.id, "name": "Onesies", "alias": None},
-                        {"id": self.team2.id, "name": "T-Shirts", "alias": None},
-                    ],
-                    "address": None,
-                },
-            ],
-        )
-
-    async def test_event(self):
-        eventp = await self.Event_Pydantic.from_tortoise_orm(await Event.get(name="Test"))
-        # print(eventp.json(indent=4))
-        eventdict = eventp.dict()
-
-        # Remove timestamps
-        del eventdict["modified"]
-        del eventdict["tournament"]["created"]
-
-        self.assertEqual(
-            eventdict,
-            {
-                "event_id": self.event.event_id,
-                "name": "Test",
-                # "modified": "2020-01-28T10:43:50.901562",
-                "token": self.event.token,
-                "alias": None,
-                "tournament": {
-                    "id": self.tournament.id,
-                    "name": "New Tournament",
-                    "desc": None,
-                    # "created": "2020-01-28T10:43:50.900664"
-                },
-                "reporter": {"id": self.reporter.id, "name": "The Reporter"},
-                "participants": [
-                    {"id": self.team1.id, "name": "Onesies", "alias": None},
-                    {"id": self.team2.id, "name": "T-Shirts", "alias": None},
+                "required": [
+                    "event_id",
+                    "name",
+                    "tournament",
+                    "participants",
+                    "modified",
+                    "token",
                 ],
-                "address": {"event_id": self.address.pk, "city": "Santa Monica", "street": "Ocean"},
+                "title": "Event",
+                "type": "object",
             },
-        )
-
-    async def test_address(self):
-        addressp = await self.Address_Pydantic.from_tortoise_orm(await Address.get(street="Ocean"))
-        # print(addressp.json(indent=4))
-        addressdict = addressp.dict()
-
-        # Remove timestamps
-        del addressdict["event"]["tournament"]["created"]
-        del addressdict["event"]["modified"]
-
-        self.assertEqual(
-            addressdict,
-            {
-                "city": "Santa Monica",
-                "street": "Ocean",
-                "event": {
-                    "event_id": self.event.event_id,
-                    "name": "Test",
-                    "tournament": {
-                        "id": self.tournament.id,
-                        "name": "New Tournament",
-                        "desc": None,
+            "M2mWithO2oPk_zpacbp_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
                     },
-                    "reporter": {"id": self.reporter.id, "name": "The Reporter"},
-                    "participants": [
-                        {"id": self.team1.id, "name": "Onesies", "alias": None},
-                        {"id": self.team2.id, "name": "T-Shirts", "alias": None},
-                    ],
-                    "token": self.event.token,
-                    "alias": None,
+                    "name": {"maxLength": 64, "title": "Name", "type": "string"},
                 },
-                "event_id": self.address.event_id,
+                "required": ["id", "name"],
+                "title": "M2mWithO2oPk",
+                "type": "object",
             },
-        )
+            "Reporter_ifqfo2_leaf": {
+                "additionalProperties": False,
+                "description": "Whom is assigned as the reporter",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "Reporter",
+                "type": "object",
+            },
+            "Team_fcszy2_leaf": {
+                "additionalProperties": False,
+                "description": "Team that is a playing",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
+                    },
+                },
+                "required": ["id", "name"],
+                "title": "Team",
+                "type": "object",
+            },
+            "Tournament_zh4alg_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 32767,
+                        "minimum": -32768,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 255, "title": "Name", "type": "string"},
+                    "desc": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Desc",
+                    },
+                    "created": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Created",
+                        "type": "string",
+                    },
+                },
+                "required": ["id", "name", "created"],
+                "title": "Tournament",
+                "type": "object",
+            },
+        },
+        "additionalProperties": False,
+        "properties": {
+            "city": {"maxLength": 64, "title": "City", "type": "string"},
+            "street": {"maxLength": 128, "title": "Street", "type": "string"},
+            "m2mwitho2opks": {
+                "items": {"$ref": "#/$defs/M2mWithO2oPk_zpacbp_leaf"},
+                "title": "M2Mwitho2Opks",
+                "type": "array",
+            },
+            "event": {"$ref": "#/$defs/Event_bhjepe_leaf"},
+            "event_id": {
+                "maximum": 9223372036854775807,
+                "minimum": -9223372036854775808,
+                "title": "Event Id",
+                "type": "integer",
+            },
+        },
+        "required": ["city", "street", "event", "event_id", "m2mwitho2opks"],
+        "title": "Address",
+        "type": "object",
+    }
 
-    async def test_tournament(self):
-        tournamentp = await self.Tournament_Pydantic.from_tortoise_orm(
-            await Tournament.all().first()
-        )
-        # print(tournamentp.json(indent=4))
-        tournamentdict = tournamentp.dict()
 
-        # Remove timestamps
-        del tournamentdict["events"][0]["modified"]
-        del tournamentdict["events"][1]["modified"]
-        del tournamentdict["created"]
+@pytest.mark.asyncio
+async def test_tournament_schema(db, pydantic_setup):
+    Tournament_Pydantic = pydantic_setup["Tournament_Pydantic"]
+    assert Tournament_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Event_tymecz_leaf": {
+                "additionalProperties": False,
+                "description": "Events on the calendar",
+                "properties": {
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
+                    },
+                    "name": {"description": "The name", "title": "Name", "type": "string"},
+                    "reporter": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Reporter_ifqfo2_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Reporter",
+                    },
+                    "participants": {
+                        "items": {"$ref": "#/$defs/Team_fcszy2_leaf"},
+                        "title": "Participants",
+                        "type": "array",
+                    },
+                    "modified": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Modified",
+                        "type": "string",
+                    },
+                    "token": {"title": "Token", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
+                    },
+                    "address": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Address_zwygvk_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Address",
+                    },
+                },
+                "required": [
+                    "event_id",
+                    "name",
+                    "participants",
+                    "modified",
+                    "token",
+                ],
+                "title": "Event",
+                "type": "object",
+            },
+            "Address_zwygvk_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "city": {"maxLength": 64, "title": "City", "type": "string"},
+                    "street": {"maxLength": 128, "title": "Street", "type": "string"},
+                    "m2mwitho2opks": {
+                        "items": {"$ref": "#/$defs/M2mWithO2oPk_zpacbp_leaf"},
+                        "title": "M2Mwitho2Opks",
+                        "type": "array",
+                    },
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
+                    },
+                },
+                "required": ["city", "street", "event_id", "m2mwitho2opks"],
+                "title": "Address",
+                "type": "object",
+            },
+            "M2mWithO2oPk_zpacbp_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 64, "title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "M2mWithO2oPk",
+                "type": "object",
+            },
+            "Reporter_ifqfo2_leaf": {
+                "additionalProperties": False,
+                "description": "Whom is assigned as the reporter",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "Reporter",
+                "type": "object",
+            },
+            "Team_fcszy2_leaf": {
+                "additionalProperties": False,
+                "description": "Team that is a playing",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
+                    },
+                },
+                "required": ["id", "name"],
+                "title": "Team",
+                "type": "object",
+            },
+        },
+        "additionalProperties": False,
+        "properties": {
+            "id": {"maximum": 32767, "minimum": -32768, "title": "Id", "type": "integer"},
+            "name": {"maxLength": 255, "title": "Name", "type": "string"},
+            "desc": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "nullable": True,
+                "title": "Desc",
+            },
+            "created": {
+                "format": "date-time",
+                "readOnly": True,
+                "title": "Created",
+                "type": "string",
+            },
+            "events": {
+                "description": "What tournaments is a happenin'",
+                "items": {"$ref": "#/$defs/Event_tymecz_leaf"},
+                "title": "Events",
+                "type": "array",
+            },
+        },
+        "required": ["id", "name", "created", "events"],
+        "title": "Tournament",
+        "type": "object",
+    }
 
-        self.assertEqual(
-            tournamentdict,
-            {
-                "id": self.tournament.id,
+
+@pytest.mark.asyncio
+async def test_team_schema(db, pydantic_setup):
+    Team_Pydantic = pydantic_setup["Team_Pydantic"]
+    assert Team_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Event_3zjun4_leaf": {
+                "additionalProperties": False,
+                "description": "Events on the calendar",
+                "properties": {
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
+                    },
+                    "name": {"description": "The name", "title": "Name", "type": "string"},
+                    "tournament": {
+                        "$ref": "#/$defs/Tournament_zh4alg_leaf",
+                        "description": "What tournaments is a happenin'",
+                    },
+                    "reporter": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Reporter_ifqfo2_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Reporter",
+                    },
+                    "modified": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Modified",
+                        "type": "string",
+                    },
+                    "token": {"title": "Token", "type": "string"},
+                    "alias": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Alias",
+                    },
+                    "address": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Address_zwygvk_leaf"},
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Address",
+                    },
+                },
+                "required": [
+                    "event_id",
+                    "name",
+                    "tournament",
+                    "modified",
+                    "token",
+                ],
+                "title": "Event",
+                "type": "object",
+            },
+            "Address_zwygvk_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "city": {"maxLength": 64, "title": "City", "type": "string"},
+                    "street": {"maxLength": 128, "title": "Street", "type": "string"},
+                    "m2mwitho2opks": {
+                        "items": {"$ref": "#/$defs/M2mWithO2oPk_zpacbp_leaf"},
+                        "title": "M2Mwitho2Opks",
+                        "type": "array",
+                    },
+                    "event_id": {
+                        "maximum": 9223372036854775807,
+                        "minimum": -9223372036854775808,
+                        "title": "Event Id",
+                        "type": "integer",
+                    },
+                },
+                "required": ["city", "street", "event_id", "m2mwitho2opks"],
+                "title": "Address",
+                "type": "object",
+            },
+            "M2mWithO2oPk_zpacbp_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 64, "title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "M2mWithO2oPk",
+                "type": "object",
+            },
+            "Reporter_ifqfo2_leaf": {
+                "additionalProperties": False,
+                "description": "Whom is assigned as the reporter",
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"title": "Name", "type": "string"},
+                },
+                "required": ["id", "name"],
+                "title": "Reporter",
+                "type": "object",
+            },
+            "Tournament_zh4alg_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 32767,
+                        "minimum": -32768,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 255, "title": "Name", "type": "string"},
+                    "desc": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Desc",
+                    },
+                    "created": {
+                        "format": "date-time",
+                        "readOnly": True,
+                        "title": "Created",
+                        "type": "string",
+                    },
+                },
+                "required": ["id", "name", "created"],
+                "title": "Tournament",
+                "type": "object",
+            },
+        },
+        "additionalProperties": False,
+        "description": "Team that is a playing",
+        "properties": {
+            "id": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "title": "Id",
+                "type": "integer",
+            },
+            "name": {"title": "Name", "type": "string"},
+            "alias": {
+                "anyOf": [
+                    {"maximum": 2147483647, "minimum": -2147483648, "type": "integer"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Alias",
+            },
+            "events": {
+                "items": {"$ref": "#/$defs/Event_3zjun4_leaf"},
+                "title": "Events",
+                "type": "array",
+            },
+        },
+        "required": ["id", "name", "events"],
+        "title": "Team",
+        "type": "object",
+    }
+
+
+@pytest.mark.asyncio
+async def test_eventlist(db, pydantic_setup):
+    Event_Pydantic_List = pydantic_setup["Event_Pydantic_List"]
+    event = pydantic_setup["event"]
+    event2 = pydantic_setup["event2"]
+    tournament = pydantic_setup["tournament"]
+    reporter = pydantic_setup["reporter"]
+    team1 = pydantic_setup["team1"]
+    team2 = pydantic_setup["team2"]
+    address = pydantic_setup["address"]
+
+    eventlp = await Event_Pydantic_List.from_queryset(Event.all())
+    eventldict = eventlp.model_dump()
+
+    # Remove timestamps
+    del eventldict[0]["modified"]
+    del eventldict[0]["tournament"]["created"]
+    del eventldict[1]["modified"]
+    del eventldict[1]["tournament"]["created"]
+
+    assert eventldict == [
+        {
+            "event_id": event.event_id,
+            "name": "Test",
+            # "modified": "2020-01-28T10:43:50.901562",
+            "token": event.token,
+            "alias": None,
+            "tournament": {
+                "id": tournament.id,
                 "name": "New Tournament",
                 "desc": None,
-                # "created": "2020-01-28T19:41:38.059617",
-                "events": [
-                    {
-                        "event_id": self.event.event_id,
-                        "name": "Test",
-                        # "modified": "2020-01-28T19:41:38.060070",
-                        "token": self.event.token,
-                        "alias": None,
-                        "reporter": {"id": self.reporter.id, "name": "The Reporter"},
-                        "participants": [
-                            {"id": self.team1.id, "name": "Onesies", "alias": None},
-                            {"id": self.team2.id, "name": "T-Shirts", "alias": None},
-                        ],
-                        "address": {
-                            "event_id": self.address.pk,
-                            "city": "Santa Monica",
-                            "street": "Ocean",
-                        },
-                    },
-                    {
-                        "event_id": self.event2.event_id,
-                        "name": "Test2",
-                        # "modified": "2020-01-28T19:41:38.060070",
-                        "token": self.event2.token,
-                        "alias": None,
-                        "reporter": None,
-                        "participants": [
-                            {"id": self.team1.id, "name": "Onesies", "alias": None},
-                            {"id": self.team2.id, "name": "T-Shirts", "alias": None},
-                        ],
-                        "address": None,
-                    },
-                ],
+                # "created": "2020-01-28T10:43:50.900664"
             },
-        )
+            "reporter": {"id": reporter.id, "name": "The Reporter"},
+            "participants": [
+                {"id": team1.id, "name": "Onesies", "alias": None},
+                {"id": team2.id, "name": "T-Shirts", "alias": None},
+            ],
+            "address": {
+                "event_id": address.pk,
+                "city": "Santa Monica",
+                "m2mwitho2opks": [],
+                "street": "Ocean",
+            },
+        },
+        {
+            "event_id": event2.event_id,
+            "name": "Test2",
+            # "modified": "2020-01-28T10:43:50.901562",
+            "token": event2.token,
+            "alias": None,
+            "tournament": {
+                "id": tournament.id,
+                "name": "New Tournament",
+                "desc": None,
+                # "created": "2020-01-28T10:43:50.900664"
+            },
+            "reporter": None,
+            "participants": [
+                {"id": team1.id, "name": "Onesies", "alias": None},
+                {"id": team2.id, "name": "T-Shirts", "alias": None},
+            ],
+            "address": None,
+        },
+    ]
 
-    async def test_team(self):
-        teamp = await self.Team_Pydantic.from_tortoise_orm(await Team.get(id=self.team1.id))
-        # print(teamp.json(indent=4))
-        teamdict = teamp.dict()
 
-        # Remove timestamps
-        del teamdict["events"][0]["modified"]
-        del teamdict["events"][0]["tournament"]["created"]
-        del teamdict["events"][1]["modified"]
-        del teamdict["events"][1]["tournament"]["created"]
+@pytest.mark.asyncio
+async def test_event(db, pydantic_setup):
+    Event_Pydantic = pydantic_setup["Event_Pydantic"]
+    event = pydantic_setup["event"]
+    tournament = pydantic_setup["tournament"]
+    reporter = pydantic_setup["reporter"]
+    team1 = pydantic_setup["team1"]
+    team2 = pydantic_setup["team2"]
+    address = pydantic_setup["address"]
 
-        self.assertEqual(
-            teamdict,
+    eventp = await Event_Pydantic.from_tortoise_orm(await Event.get(name="Test"))
+    eventdict = eventp.model_dump()
+
+    # Remove timestamps
+    del eventdict["modified"]
+    del eventdict["tournament"]["created"]
+
+    assert eventdict == {
+        "event_id": event.event_id,
+        "name": "Test",
+        # "modified": "2020-01-28T10:43:50.901562",
+        "token": event.token,
+        "alias": None,
+        "tournament": {
+            "id": tournament.id,
+            "name": "New Tournament",
+            "desc": None,
+            # "created": "2020-01-28T10:43:50.900664"
+        },
+        "reporter": {"id": reporter.id, "name": "The Reporter"},
+        "participants": [
+            {"id": team1.id, "name": "Onesies", "alias": None},
+            {"id": team2.id, "name": "T-Shirts", "alias": None},
+        ],
+        "address": {
+            "event_id": address.pk,
+            "city": "Santa Monica",
+            "m2mwitho2opks": [],
+            "street": "Ocean",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_address(db, pydantic_setup):
+    Address_Pydantic = pydantic_setup["Address_Pydantic"]
+    event = pydantic_setup["event"]
+    tournament = pydantic_setup["tournament"]
+    reporter = pydantic_setup["reporter"]
+    team1 = pydantic_setup["team1"]
+    team2 = pydantic_setup["team2"]
+    address = pydantic_setup["address"]
+
+    addressp = await Address_Pydantic.from_tortoise_orm(await Address.get(street="Ocean"))
+    addressdict = addressp.model_dump()
+
+    # Remove timestamps
+    del addressdict["event"]["tournament"]["created"]
+    del addressdict["event"]["modified"]
+
+    assert addressdict == {
+        "city": "Santa Monica",
+        "street": "Ocean",
+        "event": {
+            "event_id": event.event_id,
+            "name": "Test",
+            "tournament": {
+                "id": tournament.id,
+                "name": "New Tournament",
+                "desc": None,
+            },
+            "reporter": {"id": reporter.id, "name": "The Reporter"},
+            "participants": [
+                {"id": team1.id, "name": "Onesies", "alias": None},
+                {"id": team2.id, "name": "T-Shirts", "alias": None},
+            ],
+            "token": event.token,
+            "alias": None,
+        },
+        "event_id": address.event_id,
+        "m2mwitho2opks": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_tournament(db, pydantic_setup):
+    Tournament_Pydantic = pydantic_setup["Tournament_Pydantic"]
+    event = pydantic_setup["event"]
+    event2 = pydantic_setup["event2"]
+    tournament = pydantic_setup["tournament"]
+    reporter = pydantic_setup["reporter"]
+    team1 = pydantic_setup["team1"]
+    team2 = pydantic_setup["team2"]
+    address = pydantic_setup["address"]
+
+    tournamentp = await Tournament_Pydantic.from_tortoise_orm(await Tournament.all().first())
+    tournamentdict = tournamentp.model_dump()
+
+    # Remove timestamps
+    del tournamentdict["events"][0]["modified"]
+    del tournamentdict["events"][1]["modified"]
+    del tournamentdict["created"]
+
+    assert tournamentdict == {
+        "id": tournament.id,
+        "name": "New Tournament",
+        "desc": None,
+        # "created": "2020-01-28T19:41:38.059617",
+        "events": [
             {
-                "id": self.team1.id,
-                "name": "Onesies",
+                "event_id": event.event_id,
+                "name": "Test",
+                # "modified": "2020-01-28T19:41:38.060070",
+                "token": event.token,
                 "alias": None,
-                "events": [
-                    {
-                        "event_id": self.event.event_id,
-                        "name": "Test",
-                        # "modified": "2020-01-28T19:47:03.334077",
-                        "token": self.event.token,
-                        "alias": None,
-                        "tournament": {
-                            "id": self.tournament.id,
-                            "name": "New Tournament",
-                            "desc": None,
-                            # "created": "2020-01-28T19:41:38.059617",
-                        },
-                        "reporter": {"id": self.reporter.id, "name": "The Reporter"},
-                        "address": {
-                            "event_id": self.address.pk,
-                            "city": "Santa Monica",
-                            "street": "Ocean",
-                        },
-                    },
-                    {
-                        "event_id": self.event2.event_id,
-                        "name": "Test2",
-                        # "modified": "2020-01-28T19:47:03.334077",
-                        "token": self.event2.token,
-                        "alias": None,
-                        "tournament": {
-                            "id": self.tournament.id,
-                            "name": "New Tournament",
-                            "desc": None,
-                            # "created": "2020-01-28T19:41:38.059617",
-                        },
-                        "reporter": None,
-                        "address": None,
-                    },
+                "reporter": {"id": reporter.id, "name": "The Reporter"},
+                "participants": [
+                    {"id": team1.id, "name": "Onesies", "alias": None},
+                    {"id": team2.id, "name": "T-Shirts", "alias": None},
                 ],
+                "address": {
+                    "event_id": address.pk,
+                    "city": "Santa Monica",
+                    "m2mwitho2opks": [],
+                    "street": "Ocean",
+                },
             },
-        )
-
-    def test_event_named(self):
-        Event_Named = pydantic_model_creator(Event, name="Foo")
-        schema = Event_Named.schema()
-        self.assertEqual(schema["title"], "Foo")
-        self.assertSetEqual(
-            set(schema["properties"].keys()),
             {
-                "address",
-                "alias",
-                "event_id",
-                "modified",
-                "name",
-                "participants",
-                "reporter",
-                "token",
-                "tournament",
+                "event_id": event2.event_id,
+                "name": "Test2",
+                # "modified": "2020-01-28T19:41:38.060070",
+                "token": event2.token,
+                "alias": None,
+                "reporter": None,
+                "participants": [
+                    {"id": team1.id, "name": "Onesies", "alias": None},
+                    {"id": team2.id, "name": "T-Shirts", "alias": None},
+                ],
+                "address": None,
             },
-        )
+        ],
+    }
 
-    def test_event_sorted(self):
-        Event_Named = pydantic_model_creator(Event, sort_alphabetically=True)
-        schema = Event_Named.schema()
-        self.assertEqual(
-            list(schema["properties"].keys()),
-            [
-                "address",
-                "alias",
-                "event_id",
-                "modified",
-                "name",
-                "participants",
-                "reporter",
-                "token",
-                "tournament",
-            ],
-        )
 
-    def test_event_unsorted(self):
-        Event_Named = pydantic_model_creator(Event, sort_alphabetically=False)
-        schema = Event_Named.schema()
-        self.assertEqual(
-            list(schema["properties"].keys()),
-            [
-                "event_id",
-                "name",
-                "tournament",
-                "reporter",
-                "participants",
-                "modified",
-                "token",
-                "alias",
-                "address",
-            ],
-        )
+@pytest.mark.asyncio
+async def test_team(db, pydantic_setup):
+    Team_Pydantic = pydantic_setup["Team_Pydantic"]
+    event = pydantic_setup["event"]
+    event2 = pydantic_setup["event2"]
+    tournament = pydantic_setup["tournament"]
+    reporter = pydantic_setup["reporter"]
+    team1 = pydantic_setup["team1"]
+    address = pydantic_setup["address"]
 
-    async def test_json_field(self):
-        json_field_0 = await JSONFields.create(data={"a": 1})
-        json_field_1 = await JSONFields.create(data=[{"a": 1, "b": 2}])
-        json_field_0_get = await JSONFields.get(pk=json_field_0.pk)
-        json_field_1_get = await JSONFields.get(pk=json_field_1.pk)
+    teamp = await Team_Pydantic.from_tortoise_orm(await Team.get(id=team1.id))
+    teamdict = teamp.model_dump()
 
-        creator = pydantic_model_creator(JSONFields)
-        ret0 = creator.from_orm(json_field_0_get).dict()
-        self.assertEqual(
-            ret0,
+    # Remove timestamps
+    del teamdict["events"][0]["modified"]
+    del teamdict["events"][0]["tournament"]["created"]
+    del teamdict["events"][1]["modified"]
+    del teamdict["events"][1]["tournament"]["created"]
+
+    assert teamdict == {
+        "id": team1.id,
+        "name": "Onesies",
+        "alias": None,
+        "events": [
             {
-                "id": 1,
-                "data": {"a": 1},
-                "data_null": None,
-                "data_default": {"a": 1},
-                "data_validate": None,
+                "event_id": event.event_id,
+                "name": "Test",
+                # "modified": "2020-01-28T19:47:03.334077",
+                "token": event.token,
+                "alias": None,
+                "tournament": {
+                    "id": tournament.id,
+                    "name": "New Tournament",
+                    "desc": None,
+                    # "created": "2020-01-28T19:41:38.059617",
+                },
+                "reporter": {"id": reporter.id, "name": "The Reporter"},
+                "address": {
+                    "event_id": address.pk,
+                    "city": "Santa Monica",
+                    "m2mwitho2opks": [],
+                    "street": "Ocean",
+                },
             },
-        )
-        ret1 = creator.from_orm(json_field_1_get).dict()
-        self.assertEqual(
-            ret1,
             {
-                "id": 2,
-                "data": [{"a": 1, "b": 2}],
-                "data_null": None,
-                "data_default": {"a": 1},
-                "data_validate": None,
+                "event_id": event2.event_id,
+                "name": "Test2",
+                # "modified": "2020-01-28T19:47:03.334077",
+                "token": event2.token,
+                "alias": None,
+                "tournament": {
+                    "id": tournament.id,
+                    "name": "New Tournament",
+                    "desc": None,
+                    # "created": "2020-01-28T19:41:38.059617",
+                },
+                "reporter": None,
+                "address": None,
             },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_event_named(db, pydantic_setup):
+    Event_Named = pydantic_model_creator(Event, name="Foo")
+    schema = Event_Named.model_json_schema()
+    assert schema["title"] == "Foo"
+    assert set(schema["properties"].keys()) == {
+        "address",
+        "alias",
+        "event_id",
+        "modified",
+        "name",
+        "participants",
+        "reporter",
+        "token",
+        "tournament",
+    }
+
+
+@pytest.mark.asyncio
+async def test_event_sorted(db, pydantic_setup):
+    Event_Named = pydantic_model_creator(Event, sort_alphabetically=True)
+    schema = Event_Named.model_json_schema()
+    assert list(schema["properties"].keys()) == [
+        "address",
+        "alias",
+        "event_id",
+        "modified",
+        "name",
+        "participants",
+        "reporter",
+        "token",
+        "tournament",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_event_unsorted(db, pydantic_setup):
+    Event_Named = pydantic_model_creator(Event, sort_alphabetically=False)
+    schema = Event_Named.model_json_schema()
+    assert list(schema["properties"].keys()) == [
+        "event_id",
+        "name",
+        "tournament",
+        "reporter",
+        "participants",
+        "modified",
+        "token",
+        "alias",
+        "address",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_json_field(db):
+    json_field_0 = await JSONFields.create(data={"a": 1})
+    json_field_1 = await JSONFields.create(data=[{"a": 1, "b": 2}])
+    json_field_0_get = await JSONFields.get(pk=json_field_0.pk)
+    json_field_1_get = await JSONFields.get(pk=json_field_1.pk)
+
+    creator = pydantic_model_creator(JSONFields)
+    ret0 = creator.model_validate(json_field_0_get).model_dump()
+    assert ret0 == {
+        "id": json_field_0.pk,
+        "data": {"a": 1},
+        "data_null": None,
+        "data_default": {"a": 1},
+        "data_validate": None,
+        "data_pydantic": json_pydantic_default.model_dump(),
+        "data_decimal": None,
+        "data_index": None,
+    }
+    ret1 = creator.model_validate(json_field_1_get).model_dump()
+    assert ret1 == {
+        "id": json_field_1.pk,
+        "data": [{"a": 1, "b": 2}],
+        "data_null": None,
+        "data_default": {"a": 1},
+        "data_validate": None,
+        "data_pydantic": json_pydantic_default.model_dump(),
+        "data_decimal": None,
+        "data_index": None,
+    }
+
+
+def test_override_default_model_config_by_config_class(db_simple):
+    """Pydantic meta's config_class should be able to override default config."""
+    # Save original value to restore after test
+    original_value = CamelCaseAliasPerson.PydanticMeta.model_config.get("from_attributes")
+    try:
+        # Set class pydantic config's from_attributes to False
+        CamelCaseAliasPerson.PydanticMeta.model_config["from_attributes"] = False
+
+        ModelPydantic = pydantic_model_creator(
+            CamelCaseAliasPerson, name="AutoAliasPersonOverriddenORMMode"
         )
 
+        assert ModelPydantic.model_config["from_attributes"] is False
+    finally:
+        # Restore original value to avoid polluting other tests
+        if original_value is None:
+            CamelCaseAliasPerson.PydanticMeta.model_config.pop("from_attributes", None)
+        else:
+            CamelCaseAliasPerson.PydanticMeta.model_config["from_attributes"] = original_value
 
-class TestPydanticCycle(test.TestCase):
-    async def setUp(self) -> None:
-        self.Employee_Pydantic = pydantic_model_creator(Employee)
 
-        self.root = await Employee.create(name="Root")
-        self.loose = await Employee.create(name="Loose")
-        self._1 = await Employee.create(name="1. First H1", manager=self.root)
-        self._2 = await Employee.create(name="2. Second H1", manager=self.root)
-        self._1_1 = await Employee.create(name="1.1. First H2", manager=self._1)
-        self._1_1_1 = await Employee.create(name="1.1.1. First H3", manager=self._1_1)
-        self._2_1 = await Employee.create(name="2.1. Second H2", manager=self._2)
-        self._2_2 = await Employee.create(name="2.2. Third H2", manager=self._2)
+def test_override_meta_pydantic_config_by_model_creator(db_simple):
+    model_config = ConfigDict(title="Another title!")
 
-        await self._1.talks_to.add(self._2, self._1_1_1, self.loose)
-        await self._2_1.gets_talked_to.add(self._2_2, self._1_1, self.loose)
-        self.maxDiff = None
+    ModelPydantic = pydantic_model_creator(
+        CamelCaseAliasPerson,
+        model_config=model_config,
+        name="AutoAliasPersonModelCreatorConfig",
+    )
 
-    def test_schema(self):
-        self.assertEqual(
-            self.Employee_Pydantic.schema(),
-            {
-                "title": "Employee",
-                "type": "object",
+    assert model_config["title"] == ModelPydantic.model_config["title"]
+
+
+def test_config_classes_merge_all_configs(db_simple):
+    """Model creator should merge all 3 configs.
+
+    - It merges (Default, Meta's config_class and creator's config_class) together.
+    """
+    model_config = ConfigDict(str_min_length=3)
+
+    ModelPydantic = pydantic_model_creator(
+        CamelCaseAliasPerson, name="AutoAliasPersonMinLength", model_config=model_config
+    )
+
+    # Should set min_anystr_length from pydantic_model_creator's config
+    assert ModelPydantic.model_config["str_min_length"] == model_config["str_min_length"]
+    # Should set title from model PydanticMeta's config
+    assert (
+        ModelPydantic.model_config["title"]
+        == CamelCaseAliasPerson.PydanticMeta.model_config["title"]
+    )
+    # Should set orm_mode from base pydantic model configuration
+    assert (
+        ModelPydantic.model_config["from_attributes"]
+        == PydanticModel.model_config["from_attributes"]
+    )
+
+
+def test_exclude_readonly(db_simple):
+    ModelPydantic = pydantic_model_creator(Event, exclude_readonly=True)
+
+    assert "modified" not in ModelPydantic.model_json_schema()["properties"]
+
+
+def test_cache_respects_model_config_validators_and_module(db_simple):
+    assert pydantic_model_creator(Tournament) is not pydantic_model_creator(
+        Tournament, model_config={"extra": "allow"}
+    )
+    assert (
+        pydantic_model_creator(Tournament, model_config={"extra": "allow"}).model_config["extra"]
+        == "allow"
+    )
+
+    v1 = {"v": field_validator("name")(classmethod(lambda cls, x: x.upper()))}
+    v2 = {"v": field_validator("name")(classmethod(lambda cls, x: x.lower()))}
+    Upper = pydantic_model_creator(Tournament, name="TournamentValidated", validators=v1)
+    Lower = pydantic_model_creator(Tournament, name="TournamentValidated", validators=v2)
+    assert Upper is not Lower
+    assert Lower(id=1, name="Ab", created="2020-01-01T00:00:00", events=[]).name == "ab"
+
+    for i in range(20):
+        M = pydantic_model_creator(
+            Tournament,
+            name="TournamentLoop",
+            validators={"v": field_validator("name")(classmethod(lambda cls, x, i=i: str(i)))},
+        )
+        assert M(id=1, name="a", created="2020-01-01T00:00:00", events=[]).name == str(i)
+
+    A = pydantic_model_creator(Tournament, name="TournamentModule", module="a.b")
+    B = pydantic_model_creator(Tournament, name="TournamentModule", module="c.d")
+    assert A is not B
+    assert B.__module__ == "c.d"
+
+
+# Fixtures for TestPydanticCycle
+@pytest_asyncio.fixture
+async def pydantic_cycle_setup(db):
+    """Setup for pydantic cycle tests with employee hierarchy."""
+    Employee_Pydantic = pydantic_model_creator(Employee)
+
+    root = await Employee.create(name="Root")
+    loose = await Employee.create(name="Loose")
+    _1 = await Employee.create(name="1. First H1", manager=root)
+    _2 = await Employee.create(name="2. Second H1", manager=root)
+    _1_1 = await Employee.create(name="1.1. First H2", manager=_1)
+    _1_1_1 = await Employee.create(name="1.1.1. First H3", manager=_1_1)
+    _2_1 = await Employee.create(name="2.1. Second H2", manager=_2)
+    _2_2 = await Employee.create(name="2.2. Third H2", manager=_2)
+
+    await _1.talks_to.add(_2, _1_1_1, loose)
+    await _2_1.gets_talked_to.add(_2_2, _1_1, loose)
+
+    return {
+        "Employee_Pydantic": Employee_Pydantic,
+        "root": root,
+        "loose": loose,
+        "_1": _1,
+        "_2": _2,
+        "_1_1": _1_1,
+        "_1_1_1": _1_1_1,
+        "_2_1": _2_1,
+        "_2_2": _2_2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cycle_schema(db, pydantic_cycle_setup):
+    Employee_Pydantic = pydantic_cycle_setup["Employee_Pydantic"]
+    assert Employee_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Employee_eywjnx_leaf": {
+                "additionalProperties": False,
                 "properties": {
-                    "id": {"title": "Id", "minimum": 1, "maximum": 2147483647, "type": "integer"},
-                    "name": {"title": "Name", "maxLength": 50, "type": "string"},
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 50, "title": "Name", "type": "string"},
                     "talks_to": {
+                        "items": {"$ref": "#/$defs/Employee_ic5xpw_leaf"},
                         "title": "Talks To",
                         "type": "array",
-                        "items": {"$ref": "#/definitions/tests.testmodels.Employee.5gupxf"},
                     },
                     "manager_id": {
-                        "title": "Manager Id",
-                        "minimum": 1,
-                        "maximum": 2147483647,
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
                         "nullable": True,
-                        "type": "integer",
+                        "title": "Manager Id",
                     },
                     "team_members": {
+                        "items": {"$ref": "#/$defs/Employee_ic5xpw_leaf"},
                         "title": "Team Members",
                         "type": "array",
-                        "items": {"$ref": "#/definitions/tests.testmodels.Employee.4fgkwn"},
                     },
-                    "name_length": {"title": "Name Length", "type": "integer"},
-                    "team_size": {
-                        "title": "Team Size",
-                        "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
+                },
+                "required": ["id", "name", "talks_to", "team_members"],
+                "title": "Employee",
+                "type": "object",
+            },
+            "Employee_ic5xpw_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
                         "type": "integer",
                     },
-                },
-                "required": ["id", "name", "talks_to", "team_members", "name_length", "team_size"],
-                "additionalProperties": False,
-                "definitions": {
-                    "tests.testmodels.Employee.leaf": {
-                        "title": "Employee",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
+                    "name": {"maxLength": 50, "title": "Name", "type": "string"},
+                    "manager_id": {
+                        "anyOf": [
+                            {
                                 "maximum": 2147483647,
+                                "minimum": -2147483648,
                                 "type": "integer",
                             },
-                            "name": {"title": "Name", "maxLength": 50, "type": "string"},
-                            "manager_id": {
-                                "title": "Manager Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                            "name_length": {"title": "Name Length", "type": "integer"},
-                            "team_size": {
-                                "title": "Team Size",
-                                "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
-                                "type": "integer",
-                            },
-                        },
-                        "required": ["id", "name", "name_length", "team_size"],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Employee.5gupxf": {
-                        "title": "Employee",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 50, "type": "string"},
-                            "talks_to": {
-                                "title": "Talks To",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Employee.leaf"},
-                            },
-                            "manager_id": {
-                                "title": "Manager Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                            "team_members": {
-                                "title": "Team Members",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Employee.leaf"},
-                            },
-                            "name_length": {"title": "Name Length", "type": "integer"},
-                            "team_size": {
-                                "title": "Team Size",
-                                "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
-                                "type": "integer",
-                            },
-                        },
-                        "required": [
-                            "id",
-                            "name",
-                            "talks_to",
-                            "team_members",
-                            "name_length",
-                            "team_size",
+                            {"type": "null"},
                         ],
-                        "additionalProperties": False,
-                    },
-                    "tests.testmodels.Employee.4fgkwn": {
-                        "title": "Employee",
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "title": "Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "type": "integer",
-                            },
-                            "name": {"title": "Name", "maxLength": 50, "type": "string"},
-                            "talks_to": {
-                                "title": "Talks To",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Employee.leaf"},
-                            },
-                            "manager_id": {
-                                "title": "Manager Id",
-                                "minimum": 1,
-                                "maximum": 2147483647,
-                                "nullable": True,
-                                "type": "integer",
-                            },
-                            "team_members": {
-                                "title": "Team Members",
-                                "type": "array",
-                                "items": {"$ref": "#/definitions/tests.testmodels.Employee.leaf"},
-                            },
-                            "name_length": {"title": "Name Length", "type": "integer"},
-                            "team_size": {
-                                "title": "Team Size",
-                                "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
-                                "type": "integer",
-                            },
-                        },
-                        "required": [
-                            "id",
-                            "name",
-                            "talks_to",
-                            "team_members",
-                            "name_length",
-                            "team_size",
-                        ],
-                        "additionalProperties": False,
+                        "default": None,
+                        "nullable": True,
+                        "title": "Manager Id",
                     },
                 },
+                "required": ["id", "name"],
+                "title": "Employee",
+                "type": "object",
             },
-        )
+        },
+        "additionalProperties": False,
+        "properties": {
+            "id": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "title": "Id",
+                "type": "integer",
+            },
+            "name": {"maxLength": 50, "title": "Name", "type": "string"},
+            "talks_to": {
+                "items": {"$ref": "#/$defs/Employee_eywjnx_leaf"},
+                "title": "Talks To",
+                "type": "array",
+            },
+            "manager_id": {
+                "anyOf": [
+                    {"maximum": 2147483647, "minimum": -2147483648, "type": "integer"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Manager Id",
+            },
+            "team_members": {
+                "items": {"$ref": "#/$defs/Employee_eywjnx_leaf"},
+                "title": "Team Members",
+                "type": "array",
+            },
+        },
+        "required": ["id", "name", "talks_to", "team_members"],
+        "title": "Employee",
+        "type": "object",
+    }
 
-    async def test_serialisation(self):
-        empp = await self.Employee_Pydantic.from_tortoise_orm(await Employee.get(name="Root"))
-        # print(empp.json(indent=4))
-        empdict = empp.dict()
 
-        self.assertEqual(
-            empdict,
+@pytest.mark.asyncio
+async def test_cycle_serialisation(db, pydantic_cycle_setup):
+    Employee_Pydantic = pydantic_cycle_setup["Employee_Pydantic"]
+    root = pydantic_cycle_setup["root"]
+    loose = pydantic_cycle_setup["loose"]
+    _1 = pydantic_cycle_setup["_1"]
+    _2 = pydantic_cycle_setup["_2"]
+    _1_1 = pydantic_cycle_setup["_1_1"]
+    _1_1_1 = pydantic_cycle_setup["_1_1_1"]
+    _2_1 = pydantic_cycle_setup["_2_1"]
+    _2_2 = pydantic_cycle_setup["_2_2"]
+
+    empp = await Employee_Pydantic.from_tortoise_orm(await Employee.get(name="Root"))
+    empdict = empp.model_dump()
+
+    assert empdict == {
+        "id": root.id,
+        "manager_id": None,
+        "name": "Root",
+        "talks_to": [],
+        "team_members": [
             {
-                "id": self.root.id,
-                "manager_id": None,
-                "name": "Root",
+                "id": _1.id,
+                "manager_id": root.id,
+                "name": "1. First H1",
+                "talks_to": [
+                    {
+                        "id": loose.id,
+                        "manager_id": None,
+                        "name": "Loose",
+                        "name_length": 5,
+                        "team_size": 0,
+                    },
+                    {
+                        "id": _2.id,
+                        "manager_id": root.id,
+                        "name": "2. Second H1",
+                        "name_length": 12,
+                        "team_size": 0,
+                    },
+                    {
+                        "id": _1_1_1.id,
+                        "manager_id": _1_1.id,
+                        "name": "1.1.1. First H3",
+                        "name_length": 15,
+                        "team_size": 0,
+                    },
+                ],
+                "team_members": [
+                    {
+                        "id": _1_1.id,
+                        "manager_id": _1.id,
+                        "name": "1.1. First H2",
+                        "name_length": 13,
+                        "team_size": 0,
+                    }
+                ],
+                "name_length": 11,
+                "team_size": 1,
+            },
+            {
+                "id": _2.id,
+                "manager_id": root.id,
+                "name": "2. Second H1",
                 "talks_to": [],
                 "team_members": [
                     {
-                        "id": self._1.id,
-                        "manager_id": self.root.id,
-                        "name": "1. First H1",
-                        "talks_to": [
-                            {
-                                "id": self.loose.id,
-                                "manager_id": None,
-                                "name": "Loose",
-                                "name_length": 5,
-                                "team_size": 0,
-                            },
-                            {
-                                "id": self._2.id,
-                                "manager_id": self.root.id,
-                                "name": "2. Second H1",
-                                "name_length": 12,
-                                "team_size": 0,
-                            },
-                            {
-                                "id": self._1_1_1.id,
-                                "manager_id": self._1_1.id,
-                                "name": "1.1.1. First H3",
-                                "name_length": 15,
-                                "team_size": 0,
-                            },
-                        ],
-                        "team_members": [
-                            {
-                                "id": self._1_1.id,
-                                "manager_id": self._1.id,
-                                "name": "1.1. First H2",
-                                "name_length": 13,
-                                "team_size": 0,
-                            }
-                        ],
-                        "name_length": 11,
-                        "team_size": 1,
+                        "id": _2_1.id,
+                        "manager_id": _2.id,
+                        "name": "2.1. Second H2",
+                        "name_length": 14,
+                        "team_size": 0,
                     },
                     {
-                        "id": self._2.id,
-                        "manager_id": self.root.id,
-                        "name": "2. Second H1",
-                        "talks_to": [],
-                        "team_members": [
-                            {
-                                "id": self._2_1.id,
-                                "manager_id": self._2.id,
-                                "name": "2.1. Second H2",
-                                "name_length": 14,
-                                "team_size": 0,
-                            },
-                            {
-                                "id": self._2_2.id,
-                                "manager_id": self._2.id,
-                                "name": "2.2. Third H2",
-                                "name_length": 13,
-                                "team_size": 0,
-                            },
-                        ],
-                        "name_length": 12,
-                        "team_size": 2,
+                        "id": _2_2.id,
+                        "manager_id": _2.id,
+                        "name": "2.2. Third H2",
+                        "name_length": 13,
+                        "team_size": 0,
                     },
                 ],
-                "name_length": 4,
+                "name_length": 12,
                 "team_size": 2,
             },
+        ],
+        "name_length": 4,
+        "team_size": 2,
+    }
+
+
+# Fixtures for TestPydanticComputed
+@pytest_asyncio.fixture
+async def pydantic_computed_setup(db):
+    """Setup for pydantic computed field tests."""
+    Employee_Pydantic = pydantic_model_creator(Employee)
+    employee = await Employee.create(name="Some Employee")
+
+    return {
+        "Employee_Pydantic": Employee_Pydantic,
+        "employee": employee,
+    }
+
+
+@pytest.mark.asyncio
+async def test_computed_field(db, pydantic_computed_setup):
+    Employee_Pydantic = pydantic_computed_setup["Employee_Pydantic"]
+    employee = pydantic_computed_setup["employee"]
+
+    employee_pyd = await Employee_Pydantic.from_tortoise_orm(
+        await Employee.get(name="Some Employee")
+    )
+    employee_serialised = employee_pyd.model_dump()
+    assert employee_serialised.get("name_length") == employee.name_length()
+
+
+@pytest.mark.asyncio
+async def test_computed_field_schema(db, pydantic_computed_setup):
+    Employee_Pydantic = pydantic_computed_setup["Employee_Pydantic"]
+    assert Employee_Pydantic.model_json_schema(mode="serialization") == {
+        "$defs": {
+            "Employee_ic5xpw_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 50, "title": "Name", "type": "string"},
+                    "manager_id": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Manager Id",
+                    },
+                    "name_length": {
+                        "description": "",
+                        "readOnly": True,
+                        "title": "Name Length",
+                        "type": "integer",
+                    },
+                    "team_size": {
+                        "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
+                        "readOnly": True,
+                        "title": "Team Size",
+                        "type": "integer",
+                    },
+                },
+                "required": ["id", "name", "name_length", "team_size"],
+                "title": "Employee",
+                "type": "object",
+            },
+            "Employee_eywjnx_leaf": {
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "title": "Id",
+                        "type": "integer",
+                    },
+                    "name": {"maxLength": 50, "title": "Name", "type": "string"},
+                    "talks_to": {
+                        "items": {"$ref": "#/$defs/Employee_ic5xpw_leaf"},
+                        "title": "Talks To",
+                        "type": "array",
+                    },
+                    "manager_id": {
+                        "anyOf": [
+                            {
+                                "maximum": 2147483647,
+                                "minimum": -2147483648,
+                                "type": "integer",
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "nullable": True,
+                        "title": "Manager Id",
+                    },
+                    "team_members": {
+                        "items": {"$ref": "#/$defs/Employee_ic5xpw_leaf"},
+                        "title": "Team Members",
+                        "type": "array",
+                    },
+                    "name_length": {
+                        "description": "",
+                        "readOnly": True,
+                        "title": "Name Length",
+                        "type": "integer",
+                    },
+                    "team_size": {
+                        "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
+                        "readOnly": True,
+                        "title": "Team Size",
+                        "type": "integer",
+                    },
+                },
+                "required": [
+                    "id",
+                    "name",
+                    "talks_to",
+                    "team_members",
+                    "name_length",
+                    "team_size",
+                ],
+                "title": "Employee",
+                "type": "object",
+            },
+        },
+        "additionalProperties": False,
+        "properties": {
+            "id": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "title": "Id",
+                "type": "integer",
+            },
+            "name": {"maxLength": 50, "title": "Name", "type": "string"},
+            "talks_to": {
+                "items": {"$ref": "#/$defs/Employee_eywjnx_leaf"},
+                "title": "Talks To",
+                "type": "array",
+            },
+            "manager_id": {
+                "anyOf": [
+                    {"maximum": 2147483647, "minimum": -2147483648, "type": "integer"},
+                    {"type": "null"},
+                ],
+                "default": None,
+                "nullable": True,
+                "title": "Manager Id",
+            },
+            "team_members": {
+                "items": {"$ref": "#/$defs/Employee_eywjnx_leaf"},
+                "title": "Team Members",
+                "type": "array",
+            },
+            "name_length": {
+                "description": "",
+                "readOnly": True,
+                "title": "Name Length",
+                "type": "integer",
+            },
+            "team_size": {
+                "description": "Computes team size.<br/><br/>Note that this function needs to be annotated with a return type so that pydantic can<br/> generate a valid schema.<br/><br/>Note that the pydantic serializer can't call async methods, but the tortoise helpers<br/> pre-fetch relational data, so that it is available before serialization. So we don't<br/> need to await the relation. We do however have to protect against the case where no<br/> prefetching was done, hence catching and handling the<br/> ``tortoise.exceptions.NoValuesFetched`` exception.",
+                "readOnly": True,
+                "title": "Team Size",
+                "type": "integer",
+            },
+        },
+        "required": ["id", "name", "talks_to", "team_members", "name_length", "team_size"],
+        "title": "Employee",
+        "type": "object",
+    }
+
+
+# Tests for TestPydanticUpdate
+def test_create_schema(db_simple):
+    UserCreate_Pydantic = pydantic_model_creator(
+        User,
+        name="UserCreate",
+        exclude_readonly=True,
+    )
+    assert UserCreate_Pydantic.model_json_schema() == {
+        "title": "UserCreate",
+        "type": "object",
+        "properties": {
+            "username": {
+                "title": "Username",
+                "maxLength": 32,
+                "type": "string",
+            },
+            "mail": {
+                "title": "Mail",
+                "maxLength": 64,
+                "type": "string",
+            },
+            "bio": {
+                "title": "Bio",
+                "type": "string",
+            },
+        },
+        "required": [
+            "username",
+            "mail",
+            "bio",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def test_update_schema(db_simple):
+    """All fields of this schema should be optional.
+    This demonstrates an example PATCH endpoint in an API, where a client may want
+    to update a single field of a model without modifying the rest.
+    """
+    UserUpdate_Pydantic = pydantic_model_creator(
+        User,
+        name="UserUpdate",
+        exclude_readonly=True,
+        optional=("username", "mail", "bio"),
+    )
+    assert UserUpdate_Pydantic.model_json_schema() == {
+        "additionalProperties": False,
+        "properties": {
+            "bio": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Bio",
+            },
+            "mail": {
+                "anyOf": [{"maxLength": 64, "type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Mail",
+            },
+            "username": {
+                "anyOf": [{"maxLength": 32, "type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Username",
+            },
+        },
+        "title": "UserUpdate",
+        "type": "object",
+    }
+
+
+# Tests for TestPydanticOptionalUpdate
+def test_optional_update(db_simple):
+    UserUpdateAllOptional_Pydantic = pydantic_model_creator(
+        User,
+        name="UserUpdateAllOptional",
+        exclude_readonly=True,
+        optional=("username", "mail", "bio"),
+    )
+    UserUpdatePartialOptional_Pydantic = pydantic_model_creator(
+        User,
+        name="UserUpdatePartialOptional",
+        exclude_readonly=True,
+        optional=("username", "mail"),
+    )
+    UserUpdateWithoutOptional_Pydantic = pydantic_model_creator(
+        User,
+        name="UserUpdateWithoutOptional",
+        exclude_readonly=True,
+    )
+
+    # All fields are optional
+    assert UserUpdateAllOptional_Pydantic().model_dump(exclude_unset=True) == {}
+    assert UserUpdateAllOptional_Pydantic(bio="foo").model_dump(exclude_unset=True) == {
+        "bio": "foo"
+    }
+    assert UserUpdateAllOptional_Pydantic(username="name", mail="a@example.com").model_dump(
+        exclude_unset=True
+    ) == {"username": "name", "mail": "a@example.com"}
+    assert UserUpdateAllOptional_Pydantic(username="name", mail="a@example.com").model_dump() == {
+        "username": "name",
+        "mail": "a@example.com",
+        "bio": None,
+    }
+    # Some fields are optional
+    with pytest.raises(ValidationError):
+        UserUpdatePartialOptional_Pydantic()
+    with pytest.raises(ValidationError):
+        UserUpdatePartialOptional_Pydantic(username="name")
+    assert UserUpdatePartialOptional_Pydantic(bio="foo").model_dump(exclude_unset=True) == {
+        "bio": "foo"
+    }
+    assert UserUpdatePartialOptional_Pydantic(
+        username="name", mail="a@example.com", bio=""
+    ).model_dump(exclude_unset=True) == {"username": "name", "mail": "a@example.com", "bio": ""}
+    assert UserUpdatePartialOptional_Pydantic(mail="a@example.com", bio="").model_dump() == {
+        "username": None,
+        "mail": "a@example.com",
+        "bio": "",
+    }
+    # None of the fields is optional
+    with pytest.raises(ValidationError):
+        UserUpdateWithoutOptional_Pydantic()
+    with pytest.raises(ValidationError):
+        UserUpdateWithoutOptional_Pydantic(username="name")
+    with pytest.raises(ValidationError):
+        UserUpdateWithoutOptional_Pydantic(username="name", email="")
+    assert UserUpdateWithoutOptional_Pydantic(
+        username="name", mail="a@example.com", bio=""
+    ).model_dump() == {"username": "name", "mail": "a@example.com", "bio": ""}
+
+
+# Tests for TestPydanticMutlipleModelUses
+def test_no_relations_model_reused(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel)
+    Pydantic2 = pydantic_model_creator(NoRelationsModel)
+
+    assert Pydantic1 is Pydantic2
+
+
+def test_no_relations_model_one_exclude(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel)
+    Pydantic2 = pydantic_model_creator(NoRelationsModel, exclude=("id",))
+
+    assert Pydantic1 is not Pydantic2
+    assert "id" in Pydantic1.model_json_schema()["required"]
+    assert "id" not in Pydantic2.model_json_schema()["required"]
+
+
+def test_no_relations_model_both_exclude(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel, exclude=("id",))
+    Pydantic2 = pydantic_model_creator(NoRelationsModel, exclude=("id",))
+
+    assert Pydantic1 is Pydantic2
+    assert "id" not in Pydantic1.model_json_schema()["required"]
+    assert "id" not in Pydantic2.model_json_schema()["required"]
+
+
+def test_no_relations_model_exclude_diff(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel, exclude=("id",))
+    Pydantic2 = pydantic_model_creator(NoRelationsModel, exclude=("name",))
+
+    assert Pydantic1 is not Pydantic2
+
+
+def test_no_relations_model_exclude_readonly(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel)
+    Pydantic2 = pydantic_model_creator(NoRelationsModel, exclude_readonly=True)
+
+    assert Pydantic1 is not Pydantic2
+    assert "id" in Pydantic1.model_json_schema()["properties"]
+    assert "id" not in Pydantic2.model_json_schema()["properties"]
+
+
+def test_model_with_relations_reused(db_simple):
+    ModelWithRelations = Event
+    Pydantic1 = pydantic_model_creator(ModelWithRelations)
+    Pydantic2 = pydantic_model_creator(ModelWithRelations)
+
+    assert Pydantic1 is Pydantic2
+
+
+def test_model_with_relations_exclude(db_simple):
+    ModelWithRelations = Event
+    Pydantic1 = pydantic_model_creator(ModelWithRelations)
+    Pydantic2 = pydantic_model_creator(ModelWithRelations, exclude=("event_id",))
+
+    assert Pydantic1 is not Pydantic2
+    assert "event_id" in Pydantic1.model_json_schema()["properties"]
+    assert "event_id" not in Pydantic2.model_json_schema()["properties"]
+
+
+def test_model_with_relations_exclude_readonly(db_simple):
+    ModelWithRelations = Event
+    Pydantic1 = pydantic_model_creator(ModelWithRelations)
+    Pydantic2 = pydantic_model_creator(ModelWithRelations, exclude_readonly=True)
+
+    assert Pydantic1 is not Pydantic2
+    assert "event_id" in Pydantic1.model_json_schema()["properties"]
+    assert "event_id" not in Pydantic2.model_json_schema()["properties"]
+
+
+def test_named_no_relations_model(db_simple):
+    NoRelationsModel = IntFields
+    Pydantic1 = pydantic_model_creator(NoRelationsModel, name="Foo")
+    Pydantic2 = pydantic_model_creator(NoRelationsModel, name="Foo")
+
+    assert Pydantic1 is Pydantic2
+
+
+def test_named_model_with_relations(db_simple):
+    ModelWithRelations = Event
+    Pydantic1 = pydantic_model_creator(ModelWithRelations, name="Foo")
+    Pydantic2 = pydantic_model_creator(ModelWithRelations, name="Foo")
+
+    assert Pydantic1 is Pydantic2
+
+
+# Tests for TestPydanticEnum
+def test_int_enum(db_simple):
+    EnumFields_Pydantic = pydantic_model_creator(EnumFields)
+    with pytest.raises(ValidationError) as exc_info:
+        EnumFields_Pydantic.model_validate({"id": 1, "service": 4, "currency": "HUF"})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            "type": "enum",
+            "loc": ("service",),
+            "msg": "Input should be 1, 2 or 3",
+            "input": 4,
+            "ctx": {"expected": "1, 2 or 3"},
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        EnumFields_Pydantic.model_validate(
+            {"id": 1, "service": "a string, not int", "currency": "HUF"}
         )
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            "type": "enum",
+            "loc": ("service",),
+            "msg": "Input should be 1, 2 or 3",
+            "input": "a string, not int",
+            "ctx": {"expected": "1, 2 or 3"},
+        }
+    ]
+
+
+def test_str_enum(db_simple):
+    EnumFields_Pydantic = pydantic_model_creator(EnumFields)
+    with pytest.raises(ValidationError) as exc_info:
+        EnumFields_Pydantic.model_validate({"id": 1, "service": 3, "currency": "GoofyGooberDollar"})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            "type": "enum",
+            "loc": ("currency",),
+            "msg": "Input should be 'HUF', 'EUR' or 'USD'",
+            "input": "GoofyGooberDollar",
+            "ctx": {"expected": "'HUF', 'EUR' or 'USD'"},
+        }
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        EnumFields_Pydantic.model_validate({"id": 1, "service": 3, "currency": 1})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            "type": "enum",
+            "loc": ("currency",),
+            "msg": "Input should be 'HUF', 'EUR' or 'USD'",
+            "input": 1,
+            "ctx": {"expected": "'HUF', 'EUR' or 'USD'"},
+        }
+    ]
+
+
+def test_enum(db_simple):
+    EnumFields_Pydantic = pydantic_model_creator(EnumFields)
+    with pytest.raises(ValidationError) as exc_info:
+        EnumFields_Pydantic.model_validate({"id": 1, "service": 4, "currency": 1})
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            "type": "enum",
+            "loc": ("service",),
+            "msg": "Input should be 1, 2 or 3",
+            "input": 4,
+            "ctx": {"expected": "1, 2 or 3"},
+        },
+        {
+            "type": "enum",
+            "loc": ("currency",),
+            "msg": "Input should be 'HUF', 'EUR' or 'USD'",
+            "input": 1,
+            "ctx": {"expected": "'HUF', 'EUR' or 'USD'"},
+        },
+    ]
+
+    # should simply not raise any error:
+    EnumFields_Pydantic.model_validate({"id": 1, "service": 3, "currency": "HUF"})
+    assert EnumFields_Pydantic.model_json_schema() == {
+        "$defs": {
+            "Currency": {
+                "enum": ["HUF", "EUR", "USD"],
+                "title": "Currency",
+                "type": "string",
+            },
+            "Service": {"enum": [1, 2, 3], "title": "Service", "type": "integer"},
+        },
+        "additionalProperties": False,
+        "properties": {
+            "id": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "title": "Id",
+                "type": "integer",
+            },
+            "service": {
+                "$ref": "#/$defs/Service",
+                "description": "python_programming: 1<br/>database_design: 2<br/>system_administration: 3",
+                "ge": -32768,
+                "le": 32767,
+            },
+            "currency": {
+                "$ref": "#/$defs/Currency",
+                "default": "HUF",
+                "description": "HUF: HUF<br/>EUR: EUR<br/>USD: USD",
+                "maxLength": 3,
+            },
+        },
+        "required": ["id", "service"],
+        "title": "EnumFields",
+        "type": "object",
+    }
+
+
+def test_nullable_fk_not_required(db):
+    """Nullable FK/O2O relation fields should be optional (default=None) in the schema,
+    not marked as required. This is the fix for issue #1481."""
+    Event_Pydantic = pydantic_model_creator(Event, name="EventNullableTest")
+    schema = Event_Pydantic.model_json_schema()
+
+    # 'reporter' is a nullable FK (null=True) so it must NOT be required
+    assert "reporter" not in schema["required"]
+    reporter_prop = schema["properties"]["reporter"]
+    assert reporter_prop.get("nullable") is True
+    assert reporter_prop.get("default") is None
+
+    # 'tournament' is a non-nullable FK so it MUST be required
+    assert "tournament" in schema["required"]
+
+    # 'address' is a nullable O2O backward relation so it must NOT be required
+    assert "address" not in schema["required"]
+    address_prop = schema["properties"]["address"]
+    assert address_prop.get("nullable") is True
+    assert address_prop.get("default") is None
+
+
+def test_field_with_default_not_optional(db):
+    """Fields with a default value but null=False should not be marked as Optional."""
+    Event_Pydantic = pydantic_model_creator(Event, name="EventDefaultNotOptional")
+    schema = Event_Pydantic.model_json_schema()
+
+    # 'token' has default=generate_token but null is not set (defaults to False),
+    # so it must NOT allow None values
+    token_prop = schema["properties"]["token"]
+    assert token_prop == {"title": "Token", "type": "string"}
+    assert "anyOf" not in token_prop
+
+    # Validation should reject None for a non-nullable field with a default
+    with pytest.raises(ValidationError):
+        Event_Pydantic(
+            event_id=1, name="test", tournament=1, token=None, modified="2024-01-01T00:00:00"
+        )
+
+
+def test_non_class_annotation() -> None:
+    """Annotations whose origin is not a class (Literal) must not crash (#2309)."""
+
+    class AnnotatedModel(Model):
+        id = fields.IntField(primary_key=True)
+        st: Literal["a", "b"] = fields.CharField(max_length=5)  # type: ignore
+        st2: Annotated[Literal["a", "b"], "a/b"] = fields.CharField(  # type: ignore
+            max_length=1,
+            validators=[RegexValidator("^[ab]$", flags=0)],
+        )
+
+    Annotated_Pydantic = pydantic_model_creator(AnnotatedModel)
+    assert sorted(Annotated_Pydantic.model_fields) == ["id", "st", "st2"]
+    st_annotation = Annotated_Pydantic.model_fields["st"].annotation
+    st2_annotation = Annotated_Pydantic.model_fields["st2"].annotation
+    assert st2_annotation == st_annotation
+    assert st_annotation == Literal["a", "b"]  # type:ignore[comparison-overlap]
+
+
+# Tests for computed fields accessing relations (#1440)
+@pytest.mark.asyncio
+async def test_computed_field_excluded_relation_not_prefetched(db):
+    """Computed field accessing an excluded, non-prefetched relation.
+
+    When team_members is excluded from the Pydantic model AND not manually prefetched,
+    the wrapped function dispatches to the ORM object which raises NoValuesFetched.
+    If the user's function handles the error gracefully (like team_size does),
+    it returns a default. If it doesn't, NoValuesFetched propagates with a clear message.
+    """
+    Employee_Pydantic_NoTeam = pydantic_model_creator(
+        Employee,
+        name="Employee_NoTeam",
+        exclude=("team_members", "manager", "gets_talked_to"),
+        computed=("name_length", "team_size"),
+        allow_cycles=True,
+    )
+
+    root = await Employee.create(name="Root")
+    await Employee.create(name="Member1", manager=root)
+    await Employee.create(name="Member2", manager=root)
+
+    empp = await Employee_Pydantic_NoTeam.from_tortoise_orm(await Employee.get(name="Root"))
+    empdict = empp.model_dump()
+
+    assert "team_members" not in empdict
+    # team_size returns 0 because team_members was not prefetched and the
+    # team_size function gracefully handles NoValuesFetched
+    assert empdict["team_size"] == 0
+    assert empdict["name_length"] == 4
+
+
+@pytest.mark.asyncio
+async def test_computed_field_excluded_relation_works_with_manual_prefetch(db):
+    """Computed field accessing an excluded relation works when manually prefetched.
+
+    If the user prefetches the relation before calling from_tortoise_orm, the computed
+    field can access it on the ORM object even though it's excluded from the schema.
+    """
+    Employee_Pydantic_NoTeam = pydantic_model_creator(
+        Employee,
+        name="Employee_NoTeam2",
+        exclude=("team_members", "manager", "gets_talked_to"),
+        computed=("name_length", "team_size"),
+        allow_cycles=True,
+    )
+
+    root = await Employee.create(name="Root")
+    await Employee.create(name="Member1", manager=root)
+    await Employee.create(name="Member2", manager=root)
+
+    obj = await Employee.get(name="Root")
+    await obj.fetch_related("team_members")
+    empp = await Employee_Pydantic_NoTeam.from_tortoise_orm(obj)
+    empdict = empp.model_dump()
+
+    assert "team_members" not in empdict
+    assert empdict["team_size"] == 2
+    assert empdict["name_length"] == 4
+
+
+@pytest.mark.asyncio
+async def test_computed_field_relation_in_model(db, pydantic_cycle_setup):
+    """Computed field accessing a reverse relation that IS in the Pydantic model.
+
+    This tests the happy path where team_members is a Pydantic field AND team_size
+    accesses it via the ORM object.
+    """
+    Employee_Pydantic = pydantic_cycle_setup["Employee_Pydantic"]
+
+    empp = await Employee_Pydantic.from_tortoise_orm(await Employee.get(name="Root"))
+    empdict = empp.model_dump()
+
+    # team_members is present in the schema
+    assert "team_members" in empdict
+    # team_size correctly reports the count
+    assert empdict["team_size"] == 2
+    assert empdict["name_length"] == 4
+
+
+def test_pydantic_creator_cache_model_config(db_simple) -> None:
+    default_model = pydantic_model_creator(Tournament)
+    custom_model = pydantic_model_creator(Tournament, model_config=ConfigDict(extra="allow"))
+    assert default_model is not custom_model
+    assert custom_model.model_config.get("extra") == "allow"
+    cached_custom = pydantic_model_creator(Tournament, model_config=ConfigDict(extra="allow"))
+    assert cached_custom is custom_model
+
+
+def test_pydantic_creator_bypasses_cache_for_validators(db_simple) -> None:
+    default_model = pydantic_model_creator(Tournament)
+
+    def validate_name(cls, v) -> Any:
+        return v
+
+    custom_model = pydantic_model_creator(
+        Tournament, validators={"val": field_validator("name")(validate_name)}
+    )
+    assert default_model is not custom_model
+
+    # validators bypass the cache, so a second call rebuilds the model
+    second_custom = pydantic_model_creator(
+        Tournament, validators={"val": field_validator("name")(validate_name)}
+    )
+    assert second_custom is not custom_model
+
+
+def test_pydantic_creator_cache_module(db_simple) -> None:
+    default_model = pydantic_model_creator(Tournament)
+    custom_model = pydantic_model_creator(Tournament, module="custom_module")
+    assert default_model is not custom_model
+    assert custom_model.__module__ == "custom_module"
+
+    cached_custom = pydantic_model_creator(Tournament, module="custom_module")
+    assert cached_custom is custom_model

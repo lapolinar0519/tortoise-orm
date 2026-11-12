@@ -1,0 +1,53 @@
+import importlib.metadata as importlib_metadata
+import os
+import re
+import shlex
+import shutil
+import subprocess  # nosec
+import sys
+from pathlib import Path
+
+import pytest
+
+from tortoise import __version__
+from tortoise.contrib import test
+
+
+def _load_version() -> str:
+    return importlib_metadata.version("tortoise-orm")
+
+
+def test_version() -> None:
+    assert _load_version() == __version__
+
+
+def _run_shell(cmd: str, **kw) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(shlex.split(cmd), **kw)  # nosec
+
+
+def _capture_output(cmd: str) -> str:
+    return _run_shell(cmd, text=True, capture_output=True, encoding="utf-8").stdout
+
+
+@test.skipIf(
+    os.getenv("TORTOISE_TEST_POETRY_ADD", "").lower() not in ("1", "true", "yes", "on"),
+    "Env 'TORTOISE_TEST_POETRY_ADD' is not true",
+)
+def test_added_by_poetry_v2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tortoise_orm = Path(__file__).parent.resolve().parent
+    py = "{}.{}".format(*sys.version_info)
+    poetry = "poetry"
+    if shutil.which(poetry) is None:
+        poetry = "uvx " + poetry
+
+    monkeypatch.chdir(tmp_path)
+    package = "foo"
+    _run_shell(f"{poetry} new {package} --python=^{py}")
+
+    monkeypatch.chdir(tmp_path / package)
+    _run_shell(f"{poetry} config --local virtualenvs.in-project true")
+    _run_shell(f"{poetry} env use {py}")
+    r = _run_shell(f"{poetry} add {tortoise_orm}")
+    assert r.returncode == 0
+    out = _capture_output(f"{poetry} run pip list")
+    assert re.search(rf"tortoise-orm\s*{__version__}", out)

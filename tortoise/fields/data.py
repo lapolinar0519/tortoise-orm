@@ -1,31 +1,43 @@
+from __future__ import annotations
+
+import contextlib
 import datetime
 import functools
 import json
 import warnings
-from decimal import Decimal
+from collections.abc import Callable
+from decimal import Decimal, InvalidOperation, getcontext
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any, Callable, Optional, Type, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 from uuid import UUID, uuid4
 
-from pypika import functions
-from pypika.enums import SqlTypes
-from pypika.terms import Term
+from pypika_tortoise import functions
+from pypika_tortoise.enums import SqlTypes
+from pypika_tortoise.terms import Term
 
 from tortoise import timezone
 from tortoise.exceptions import ConfigurationError, FieldError
 from tortoise.fields.base import Field
-from tortoise.timezone import get_timezone, get_use_tz, localtime
+from tortoise.timezone import get_default_timezone, get_use_tz, parse_datetime
 from tortoise.validators import MaxLengthValidator
 
 try:
-    from ciso8601 import parse_datetime
-except ImportError:  # pragma: nocoverage
-    from iso8601 import parse_date
-
-    parse_datetime = functools.partial(parse_date, default_timezone=None)
+    from pydantic import BaseModel as _PydanticBaseModel
+    from pydantic._internal._model_construction import ModelMetaclass as _PydanticModelMetaclass
+except ImportError:
+    _PydanticBaseModel = None  # type: ignore[assignment,misc]
+    _PydanticModelMetaclass = None  # type: ignore[assignment,misc]
 
 if TYPE_CHECKING:  # pragma: nocoverage
-    from tortoise.models import Model
+    import sys
+
+    if sys.version_info >= (3, 11):
+        from typing import Unpack
+    else:
+        from typing_extensions import Unpack
+
+    from ..models import Model
+    from .base import FieldKwargs, FieldKwargsCommon, FieldKwargsNoPk, JSONFieldKwargs
 
 __all__ = (
     "BigIntField",
@@ -43,45 +55,80 @@ __all__ = (
     "SmallIntField",
     "TextField",
     "TimeDeltaField",
+    "TimeField",
     "UUIDField",
 )
 
+T = TypeVar("T")
+T_STR = TypeVar("T_STR", str, str | None)
+T_INT = TypeVar("T_INT", int, int | None)
+T_BOOL = TypeVar("T_BOOL", bool, bool | None)
+T_DECIMAL = TypeVar("T_DECIMAL", Decimal, Decimal | None)
+T_DATETIME = TypeVar("T_DATETIME", datetime.datetime, datetime.datetime | None)
+T_DATE = TypeVar("T_DATE", datetime.date, datetime.date | None)
+T_TIME = TypeVar("T_TIME", datetime.time, datetime.time | None)
+T_TIMEDELTA = TypeVar("T_TIMEDELTA", datetime.timedelta, datetime.timedelta | None)
+T_FLOAT = TypeVar("T_FLOAT", float, float | None)
+T_UUID = TypeVar("T_UUID", UUID, UUID | None)
+T_BINARY = TypeVar("T_BINARY", bytes, bytes | None)
+
 # Doing this we can replace json dumps/loads with different implementations
 JsonDumpsFunc = Callable[[Any], str]
-JsonLoadsFunc = Callable[[str], Any]
+JsonLoadsFunc = Callable[[str | bytes], Any]
 JSON_DUMPS: JsonDumpsFunc = functools.partial(json.dumps, separators=(",", ":"))
 JSON_LOADS: JsonLoadsFunc = json.loads
 
 try:
-    # Use python-rapidjson as an optional accelerator
-    import rapidjson
+    # Use orjson as an optional accelerator
+    import orjson
 
-    JSON_DUMPS = rapidjson.dumps
-    JSON_LOADS = rapidjson.loads
+    def _orjson_dumps(obj: Any) -> str:
+        return orjson.dumps(obj).decode()
+
+    JSON_DUMPS = _orjson_dumps
+    JSON_LOADS = orjson.loads
 except ImportError:  # pragma: nocoverage
     pass
 
 
-class IntField(Field, int):
+class IntField(Field[T_INT], int):
     """
     Integer field. (32-bit signed)
 
-    ``pk`` (bool):
+    ``primary_key`` (bool):
         True if field is Primary Key.
     """
 
     SQL_TYPE = "INT"
     allows_generated = True
 
-    def __init__(self, pk: bool = False, **kwargs: Any) -> None:
-        if pk:
+    @overload
+    def __init__(
+        self: IntField[int],
+        primary_key: bool | None = None,
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargsNoPk[int]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: IntField[int | None],
+        primary_key: bool | None = None,
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargsNoPk[int]],
+    ) -> None: ...
+
+    def __init__(self, primary_key: bool | None = None, **kwargs: Any) -> None:
+        if primary_key or kwargs.get("pk"):
             kwargs["generated"] = bool(kwargs.get("generated", True))
-        super().__init__(pk=pk, **kwargs)
+        super().__init__(primary_key=primary_key, **kwargs)
 
     @property
     def constraints(self) -> dict:
         return {
-            "ge": 1 if self.generated or self.reference else -2147483648,
+            "ge": -2147483648,
             "le": 2147483647,
         }
 
@@ -94,74 +141,75 @@ class IntField(Field, int):
     class _db_mysql:
         GENERATED_SQL = "INT NOT NULL PRIMARY KEY AUTO_INCREMENT"
 
+    class _db_mssql:
+        GENERATED_SQL = "INT IDENTITY(1,1) NOT NULL PRIMARY KEY"
 
-class BigIntField(Field, int):
+    class _db_oracle:
+        GENERATED_SQL = "INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY NOT NULL"
+
+
+class BigIntField(IntField):
     """
     Big integer field. (64-bit signed)
 
-    ``pk`` (bool):
+    ``primary_key`` (bool):
         True if field is Primary Key.
     """
 
     SQL_TYPE = "BIGINT"
-    allows_generated = True
-
-    def __init__(self, pk: bool = False, **kwargs: Any) -> None:
-        if pk:
-            kwargs["generated"] = bool(kwargs.get("generated", True))
-        super().__init__(pk=pk, **kwargs)
 
     @property
     def constraints(self) -> dict:
         return {
-            "ge": 1 if self.generated or self.reference else -9223372036854775808,
+            "ge": -9223372036854775808,
             "le": 9223372036854775807,
         }
 
     class _db_postgres:
         GENERATED_SQL = "BIGSERIAL NOT NULL PRIMARY KEY"
 
-    class _db_sqlite:
-        GENERATED_SQL = "INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL"
-
     class _db_mysql:
         GENERATED_SQL = "BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT"
 
+    class _db_mssql:
+        GENERATED_SQL = "BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY"
 
-class SmallIntField(Field, int):
+    class _db_oracle:
+        SQL_TYPE = "INT"
+        GENERATED_SQL = "INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY NOT NULL"
+
+
+class SmallIntField(IntField):
     """
     Small integer field. (16-bit signed)
 
-    ``pk`` (bool):
+    ``primary_key`` (bool):
         True if field is Primary Key.
     """
 
     SQL_TYPE = "SMALLINT"
-    allows_generated = True
-
-    def __init__(self, pk: bool = False, **kwargs: Any) -> None:
-        if pk:
-            kwargs["generated"] = bool(kwargs.get("generated", True))
-        super().__init__(pk=pk, **kwargs)
 
     @property
     def constraints(self) -> dict:
         return {
-            "ge": 1 if self.generated or self.reference else -32768,
+            "ge": -32768,
             "le": 32767,
         }
 
     class _db_postgres:
         GENERATED_SQL = "SMALLSERIAL NOT NULL PRIMARY KEY"
 
-    class _db_sqlite:
-        GENERATED_SQL = "INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL"
-
     class _db_mysql:
         GENERATED_SQL = "SMALLINT NOT NULL PRIMARY KEY AUTO_INCREMENT"
 
+    class _db_mssql:
+        GENERATED_SQL = "SMALLINT IDENTITY(1,1) NOT NULL PRIMARY KEY"
 
-class CharField(Field, str):  # type: ignore
+    class _db_oracle:
+        GENERATED_SQL = "SMALLINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY NOT NULL"
+
+
+class CharField(Field[T_STR]):
     """
     Character field.
 
@@ -170,6 +218,26 @@ class CharField(Field, str):  # type: ignore
     ``max_length`` (int):
         Maximum length of the field in characters.
     """
+
+    field_type = str
+
+    @overload
+    def __init__(
+        self: CharField[str],
+        max_length: int,
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[str]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: CharField[str | None],
+        max_length: int,
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[str]],
+    ) -> None: ...
 
     def __init__(self, max_length: int, **kwargs: Any) -> None:
         if int(max_length) < 1:
@@ -185,11 +253,19 @@ class CharField(Field, str):  # type: ignore
         }
 
     @property
-    def SQL_TYPE(self) -> str:  # type: ignore
+    def SQL_TYPE(self) -> str:  # type: ignore[override]
         return f"VARCHAR({self.max_length})"
 
+    class _db_oracle:
+        def __init__(self, field: CharField) -> None:
+            self.field = field
 
-class TextField(Field, str):  # type: ignore
+        @property
+        def SQL_TYPE(self) -> str:
+            return f"NVARCHAR2({self.field.max_length})"
+
+
+class TextField(Field[T_STR], str):  # type:ignore[misc]
     """
     Large Text field.
     """
@@ -197,10 +273,36 @@ class TextField(Field, str):  # type: ignore
     indexable = False
     SQL_TYPE = "TEXT"
 
+    @overload
     def __init__(
-        self, pk: bool = False, unique: bool = False, index: bool = False, **kwargs: Any
+        self: TextField[str],
+        *,
+        primary_key: bool | None = None,
+        unique: bool = False,
+        db_index: bool = False,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargsCommon[str]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: TextField[str | None],
+        *,
+        primary_key: bool | None = None,
+        unique: bool = False,
+        db_index: bool = False,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargsCommon[str]],
+    ) -> None: ...
+
+    def __init__(
+        self,
+        primary_key: bool | None = None,
+        unique: bool = False,
+        db_index: bool = False,
+        **kwargs: Any,
     ) -> None:
-        if pk:
+        if primary_key or kwargs.get("pk"):
             warnings.warn(
                 "TextField as a PrimaryKey is Deprecated, use CharField instead",
                 DeprecationWarning,
@@ -210,16 +312,30 @@ class TextField(Field, str):  # type: ignore
             raise ConfigurationError(
                 "TextField doesn't support unique indexes, consider CharField or another strategy"
             )
-        if index:
+        if (index := kwargs.pop("index", None)) is not None:
+            warnings.warn(
+                "`index` is deprecated, please use `db_index` instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if index or db_index:
+                raise ConfigurationError("TextField can't be indexed, consider CharField")
+        elif db_index:
             raise ConfigurationError("TextField can't be indexed, consider CharField")
 
-        super().__init__(pk=pk, **kwargs)
+        super().__init__(primary_key=primary_key, **kwargs)
 
     class _db_mysql:
         SQL_TYPE = "LONGTEXT"
 
+    class _db_mssql:
+        SQL_TYPE = "NVARCHAR(MAX)"
 
-class BooleanField(Field):
+    class _db_oracle:
+        SQL_TYPE = "NCLOB"
+
+
+class BooleanField(Field[T_BOOL]):
     """
     Boolean field.
     """
@@ -228,11 +344,36 @@ class BooleanField(Field):
     field_type = bool
     SQL_TYPE = "BOOL"
 
+    @overload
+    def __init__(
+        self: BooleanField[bool],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[bool]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: BooleanField[bool | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[bool]],
+    ) -> None: ...
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
     class _db_sqlite:
         SQL_TYPE = "INT"
 
+    class _db_mssql:
+        SQL_TYPE = "BIT"
 
-class DecimalField(Field, Decimal):
+    class _db_oracle:
+        SQL_TYPE = "NUMBER(1)"
+
+
+class DecimalField(Field[T_DECIMAL], Decimal):  # type: ignore
     """
     Accurate decimal field.
 
@@ -241,10 +382,30 @@ class DecimalField(Field, Decimal):
     ``max_digits`` (int):
         Max digits of significance of the decimal field.
     ``decimal_places`` (int):
-        How many of those signifigant digits is after the decimal point.
+        How many of those significant digits is after the decimal point.
     """
 
     skip_to_python_if_native = True
+
+    @overload
+    def __init__(
+        self: DecimalField[Decimal],
+        max_digits: int,
+        decimal_places: int,
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[Decimal]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: DecimalField[Decimal | None],
+        max_digits: int,
+        decimal_places: int,
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[Decimal]],
+    ) -> None: ...
 
     def __init__(self, max_digits: int, decimal_places: int, **kwargs: Any) -> None:
         if int(max_digits) < 1:
@@ -256,17 +417,25 @@ class DecimalField(Field, Decimal):
         self.decimal_places = decimal_places
         self.quant = Decimal("1" if decimal_places == 0 else f"1.{('0' * decimal_places)}")
 
-    def to_python_value(self, value: Any) -> Optional[Decimal]:
+    @overload
+    def to_python_value(self, value: None) -> None: ...
 
+    @overload
+    def to_python_value(self, value: Any) -> Decimal: ...
+
+    def to_python_value(self, value: Any) -> Decimal | None:
         if value is None:
-            value = None
-        else:
-            value = Decimal(value).quantize(self.quant).normalize()
-        self.validate(value)
-        return value
+            return None
+        d = Decimal(value)
+        try:
+            return d.quantize(self.quant)
+        except InvalidOperation:
+            context = getcontext().copy()
+            context.prec = max(context.prec, int(self.max_digits))
+            return d.quantize(self.quant, context=context)
 
     @property
-    def SQL_TYPE(self) -> str:  # type: ignore
+    def SQL_TYPE(self) -> str:  # type: ignore[override]
         return f"DECIMAL({self.max_digits},{self.decimal_places})"
 
     class _db_sqlite:
@@ -276,7 +445,17 @@ class DecimalField(Field, Decimal):
             return functions.Cast(term, SqlTypes.NUMERIC)
 
 
-class DatetimeField(Field, datetime.datetime):
+# In case of queryset with filter `__year`/`__month`/`__day` ..., value can be int, float or str. Example:
+# `await MyModel.filter(created_at__year=2024)`
+# `await MyModel.filter(created_at__year=2024.0)`
+# `await MyModel.filter(created_at__year='2024')`
+DatetimeFieldQueryValueType = TypeVar(
+    "DatetimeFieldQueryValueType", datetime.datetime, int, float, str
+)
+DateFieldQueryValueType = TypeVar("DateFieldQueryValueType", datetime.date, int, float, str)
+
+
+class DatetimeField(Field[T_DATETIME], datetime.datetime):
     """
     Datetime field.
 
@@ -297,58 +476,93 @@ class DatetimeField(Field, datetime.datetime):
     class _db_postgres:
         SQL_TYPE = "TIMESTAMPTZ"
 
+    class _db_mssql:
+        SQL_TYPE = "DATETIME2"
+
+    class _db_oracle:
+        SQL_TYPE = "TIMESTAMP WITH TIME ZONE"
+
+    @overload
+    def __init__(
+        self: DatetimeField[datetime.datetime],
+        auto_now: bool = False,
+        auto_now_add: bool = False,
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[datetime.datetime]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: DatetimeField[datetime.datetime | None],
+        auto_now: bool = False,
+        auto_now_add: bool = False,
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[datetime.datetime]],
+    ) -> None: ...
+
     def __init__(self, auto_now: bool = False, auto_now_add: bool = False, **kwargs: Any) -> None:
         if auto_now_add and auto_now:
             raise ConfigurationError("You can choose only 'auto_now' or 'auto_now_add'")
         super().__init__(**kwargs)
         self.auto_now = auto_now
-        self.auto_now_add = auto_now | auto_now_add
+        self.auto_now_add = auto_now_add
 
-    def to_python_value(self, value: Any) -> Optional[datetime.datetime]:
-        if value is None:
-            value = None
-        else:
-            if isinstance(value, datetime.datetime):
-                value = value
-            elif isinstance(value, int):
-                value = datetime.datetime.fromtimestamp(value)
+    def to_python_value(self, value: Any) -> datetime.datetime | None:
+        if value is not None:
+            if not isinstance(value, datetime.datetime):
+                value = (
+                    datetime.datetime.fromtimestamp(value)
+                    if isinstance(value, int)
+                    else parse_datetime(value)
+                )
+            if get_use_tz():
+                # When use_tz=True, ensure all datetimes are timezone-aware
+                if timezone.is_naive(value):
+                    value = timezone.make_aware(value)
+                else:
+                    value = value.astimezone(get_default_timezone())
             else:
-                value = parse_datetime(value)
-            if timezone.is_naive(value):
-                value = timezone.make_aware(value, get_timezone())
-            else:
-                value = localtime(value)
-        self.validate(value)
+                # When use_tz=False, ensure all datetimes are naive
+                # Some backends (PostgreSQL TIMESTAMPTZ) return aware datetimes natively
+                if timezone.is_aware(value):
+                    value = value.replace(tzinfo=None)
         return value
 
     def to_db_value(
-        self, value: Optional[datetime.datetime], instance: "Union[Type[Model], Model]"
-    ) -> Optional[datetime.datetime]:
-
+        self, value: DatetimeFieldQueryValueType | None, instance: type[Model] | Model
+    ) -> DatetimeFieldQueryValueType | None:
         # Only do this if it is a Model instance, not class. Test for guaranteed instance var
         if hasattr(instance, "_saved_in_db") and (
             self.auto_now
             or (self.auto_now_add and getattr(instance, self.model_field_name) is None)
         ):
-            value = timezone.now()
-            setattr(instance, self.model_field_name, value)
-            return value
-        if value is not None:
-            if get_use_tz():
-                if timezone.is_naive(value):
-                    warnings.warn(
-                        "DateTimeField %s received a naive datetime (%s)"
-                        " while time zone support is active." % (self.model_field_name, value),
-                        RuntimeWarning,
-                    )
-                    value = timezone.make_aware(value, "UTC")
+            now = timezone.localtime() if get_use_tz() else timezone.now()
+            # Convert to match what would be read from DB (apply timezone conversion)
+            now_python = self.to_python_value(now)
+            setattr(instance, self.model_field_name, now_python)
+            return now  # type: ignore
+        if (
+            value is not None
+            and isinstance(value, datetime.datetime)
+            and get_use_tz()
+            and timezone.is_naive(value)
+        ):
+            warnings.warn(
+                f"DateTimeField {self.model_field_name} received a naive datetime ({value})"
+                " while time zone support is active.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            value = timezone.make_aware(value)  # ty:ignore[invalid-assignment]
         self.validate(value)
         return value
 
     @property
     def constraints(self) -> dict:
         data = {}
-        if self.auto_now_add:
+        if self.auto_now_add or self.auto_now:
             data["readOnly"] = True
         return data
 
@@ -359,7 +573,7 @@ class DatetimeField(Field, datetime.datetime):
         return desc
 
 
-class DateField(Field, datetime.date):
+class DateField(Field[T_DATE], datetime.date):
     """
     Date field.
     """
@@ -367,55 +581,203 @@ class DateField(Field, datetime.date):
     skip_to_python_if_native = True
     SQL_TYPE = "DATE"
 
-    def to_python_value(self, value: Any) -> Optional[datetime.date]:
+    @overload
+    def __init__(
+        self: DateField[datetime.date],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[datetime.date]],
+    ) -> None: ...
 
+    @overload
+    def __init__(
+        self: DateField[datetime.date | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[datetime.date]],
+    ) -> None: ...
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+    def to_python_value(self, value: Any) -> datetime.date | None:
         if value is not None and not isinstance(value, datetime.date):
             value = parse_datetime(value).date()
-        self.validate(value)
         return value
 
     def to_db_value(
-        self, value: Optional[Union[datetime.date, str]], instance: "Union[Type[Model], Model]"
-    ) -> Optional[datetime.date]:
-
-        if value is not None and not isinstance(value, datetime.date):
-            return_value = parse_datetime(value).date()
-        else:
-            return_value = value
-        self.validate(return_value)
-        return return_value
+        self, value: DateFieldQueryValueType | None, instance: type[Model] | Model
+    ) -> DateFieldQueryValueType | None:
+        if value is not None and isinstance(value, str) and len(value) > 4:
+            with contextlib.suppress(ValueError):
+                value = parse_datetime(value).date()  # type: ignore
+        self.validate(value)
+        return value
 
 
-class TimeDeltaField(Field, datetime.timedelta):
+class TimeField(Field[T_TIME], datetime.time):
+    """
+    Time field.
+    """
+
+    skip_to_python_if_native = True
+    SQL_TYPE = "TIME"
+
+    class _db_oracle:
+        SQL_TYPE = "NVARCHAR2(8)"
+
+    class _db_mysql:
+        SQL_TYPE = "TIME(6)"
+
+    class _db_postgres:
+        SQL_TYPE = "TIMETZ"
+
+    @overload
+    def __init__(
+        self: TimeField[datetime.time],
+        auto_now: bool = False,
+        auto_now_add: bool = False,
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[datetime.time]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: TimeField[datetime.time | None],
+        auto_now: bool = False,
+        auto_now_add: bool = False,
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[datetime.time]],
+    ) -> None: ...
+
+    def __init__(self, auto_now: bool = False, auto_now_add: bool = False, **kwargs: Any) -> None:
+        if auto_now_add and auto_now:
+            raise ConfigurationError("You can choose only 'auto_now' or 'auto_now_add'")
+        super().__init__(**kwargs)
+        self.auto_now = auto_now
+        self.auto_now_add = auto_now_add
+
+    def to_python_value(self, value: Any) -> datetime.time | datetime.timedelta | None:
+        if value is not None:
+            if isinstance(value, str):
+                value = datetime.time.fromisoformat(value)
+            if isinstance(value, datetime.timedelta):
+                return value
+            if get_use_tz():
+                if timezone.is_naive(value):
+                    value = value.replace(tzinfo=get_default_timezone())
+            else:
+                if timezone.is_aware(value):
+                    value = value.replace(tzinfo=None)
+        return value
+
+    def to_db_value(
+        self,
+        value: datetime.time | datetime.timedelta | None,
+        instance: type[Model] | Model,
+    ) -> datetime.time | datetime.timedelta | None:
+        # Only do this if it is a Model instance, not class. Test for guaranteed instance var
+        if hasattr(instance, "_saved_in_db") and (
+            self.auto_now
+            or (self.auto_now_add and getattr(instance, self.model_field_name) is None)
+        ):
+            now = timezone.now().time()
+            # Convert to match what would be read from DB (apply timezone conversion)
+            now_python = self.to_python_value(now)
+            setattr(instance, self.model_field_name, now_python)
+            return now
+        if value is not None:
+            if isinstance(value, str):
+                value = datetime.time.fromisoformat(value)
+            if isinstance(value, datetime.timedelta):
+                return value
+            if (
+                isinstance(value, datetime.datetime | datetime.time)
+                and get_use_tz()
+                and timezone.is_naive(value)
+            ):
+                warnings.warn(
+                    f"TimeField {self.model_field_name} received a naive time ({value})"
+                    " while time zone support is active.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                value = value.replace(tzinfo=get_default_timezone())
+        self.validate(value)
+        return value
+
+
+class TimeDeltaField(Field[T_TIMEDELTA]):
     """
     A field for storing time differences.
     """
 
+    field_type = datetime.timedelta
     SQL_TYPE = "BIGINT"
 
-    def to_python_value(self, value: Any) -> Optional[datetime.timedelta]:
-        self.validate(value)
+    @overload
+    def __init__(
+        self: TimeDeltaField[datetime.timedelta],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[datetime.timedelta]],
+    ) -> None: ...
 
+    @overload
+    def __init__(
+        self: TimeDeltaField[datetime.timedelta | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[datetime.timedelta]],
+    ) -> None: ...
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+    class _db_oracle:
+        SQL_TYPE = "NUMBER(19)"
+
+    def to_python_value(self, value: Any) -> datetime.timedelta | None:
         if value is None or isinstance(value, datetime.timedelta):
             return value
         return datetime.timedelta(microseconds=value)
 
     def to_db_value(
-        self, value: Optional[datetime.timedelta], instance: "Union[Type[Model], Model]"
-    ) -> Optional[int]:
+        self, value: datetime.timedelta | None, instance: type[Model] | Model
+    ) -> int | None:
         self.validate(value)
-
         if value is None:
             return None
         return (value.days * 86400000000) + (value.seconds * 1000000) + value.microseconds
 
 
-class FloatField(Field, float):
+class FloatField(Field[T_FLOAT], float):
     """
     Float (double) field.
     """
 
     SQL_TYPE = "DOUBLE PRECISION"
+
+    @overload
+    def __init__(
+        self: FloatField[float],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[float]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: FloatField[float | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[float]],
+    ) -> None: ...
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
 
     class _db_sqlite:
         SQL_TYPE = "REAL"
@@ -424,20 +786,27 @@ class FloatField(Field, float):
         SQL_TYPE = "DOUBLE"
 
 
-class JSONField(Field, dict, list):  # type: ignore
+class JSONField(Field[T], dict, list):  # type: ignore[misc]
     """
     JSON field.
 
     This field can store dictionaries or lists of any JSON-compliant structure.
 
+    You can use generics to make static checking more friendly. Example: ``JSONField[dict[str, str]]``
+
     You can specify your own custom JSON encoder/decoder, leaving at the default should work well.
-    If you have ``python-rapidjson`` installed, we default to using that,
+    If you have ``orjson`` installed, we default to using that,
     else the default ``json`` module will be used.
 
     ``encoder``:
         The custom JSON encoder.
     ``decoder``:
         The custom JSON decoder.
+
+    If you want to use Pydantic model as the field type for generating a better OpenAPI documentation, you can use ``field_type`` to specify the type of the field.
+
+    ``field_type``:
+        The Pydantic model class.
 
     """
 
@@ -447,43 +816,74 @@ class JSONField(Field, dict, list):  # type: ignore
     class _db_postgres:
         SQL_TYPE = "JSONB"
 
+    class _db_mssql:
+        SQL_TYPE = "NVARCHAR(MAX)"
+
+    class _db_oracle:
+        SQL_TYPE = "NCLOB"
+
     def __init__(
         self,
         encoder: JsonDumpsFunc = JSON_DUMPS,
         decoder: JsonLoadsFunc = JSON_LOADS,
-        **kwargs: Any,
+        **kwargs: Unpack[JSONFieldKwargs[T]],
     ) -> None:
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
+        if field_type := kwargs.get("field_type"):
+            self.field_type = field_type
 
     def to_db_value(
-        self, value: Optional[Union[dict, list, str]], instance: "Union[Type[Model], Model]"
-    ) -> Optional[str]:
+        self,
+        value: T | dict | list | str | bytes | None,
+        instance: type[Model] | Model,
+    ) -> str | None:
         self.validate(value)
+        if value is None:
+            return None
 
-        if isinstance(value, str):
+        if isinstance(value, (str, bytes)):
             try:
                 self.decoder(value)
-            except Exception:
-                raise FieldError(f"Value {value} is invalid json value.")
+            except Exception as e:
+                raise FieldError(f"Value {value!r} is invalid json value.") from e
+            if isinstance(value, bytes):
+                return value.decode()
             return value
-        return None if value is None else self.encoder(value)
+
+        if _PydanticBaseModel is not None and isinstance(value, _PydanticBaseModel):
+            if self.encoder is JSON_DUMPS:
+                return value.model_dump_json()
+            # self.encoder may be a custom json encoder
+            value = value.model_dump()
+
+        return self.encoder(value)
 
     def to_python_value(
-        self, value: Optional[Union[str, dict, list]]
-    ) -> Optional[Union[dict, list]]:
-        if isinstance(value, str):
+        self, value: T | str | bytes | dict | list | None
+    ) -> T | dict | list | None:
+        if isinstance(value, (str, bytes)):
             try:
-                return self.decoder(value)
-            except Exception:
-                raise FieldError(f"Value {value} is invalid json value.")
+                data = self.decoder(value)
+            except Exception as e:
+                raise FieldError(
+                    f"Value {value if isinstance(value, str) else value.decode()} is invalid json value."
+                ) from e
 
-        self.validate(value)
+            if (
+                _PydanticModelMetaclass is not None
+                and isinstance(self.field_type, _PydanticModelMetaclass)
+                and not isinstance(data, list)
+            ):
+                return self.field_type(**data)
+
+            return data
+
         return value
 
 
-class UUIDField(Field, UUID):
+class UUIDField(Field[T_UUID], UUID):
     """
     UUID Field
 
@@ -497,21 +897,37 @@ class UUIDField(Field, UUID):
     class _db_postgres:
         SQL_TYPE = "UUID"
 
+    @overload
+    def __init__(
+        self: UUIDField[UUID],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[UUID]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: UUIDField[UUID | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[UUID]],
+    ) -> None: ...
+
     def __init__(self, **kwargs: Any) -> None:
-        if kwargs.get("pk", False) and "default" not in kwargs:
+        if (kwargs.get("primary_key") or kwargs.get("pk", False)) and "default" not in kwargs:
             kwargs["default"] = uuid4
         super().__init__(**kwargs)
 
-    def to_db_value(self, value: Any, instance: "Union[Type[Model], Model]") -> Optional[str]:
+    def to_db_value(self, value: Any, instance: type[Model] | Model) -> str | None:
         return value and str(value)
 
-    def to_python_value(self, value: Any) -> Optional[UUID]:
+    def to_python_value(self, value: Any) -> UUID | None:
         if value is None or isinstance(value, UUID):
             return value
         return UUID(value)
 
 
-class BinaryField(Field, bytes):  # type: ignore
+class BinaryField(Field[T_BINARY], bytes):  # type: ignore[misc]
     """
     Binary field.
 
@@ -522,43 +938,67 @@ class BinaryField(Field, bytes):  # type: ignore
     indexable = False
     SQL_TYPE = "BLOB"
 
+    @overload
+    def __init__(
+        self: BinaryField[bytes],
+        *,
+        null: Literal[False] = False,
+        **kwargs: Unpack[FieldKwargs[bytes]],
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: BinaryField[bytes | None],
+        *,
+        null: Literal[True],
+        **kwargs: Unpack[FieldKwargs[bytes]],
+    ) -> None: ...
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
     class _db_postgres:
         SQL_TYPE = "BYTEA"
 
     class _db_mysql:
         SQL_TYPE = "LONGBLOB"
 
+    class _db_mssql:
+        SQL_TYPE = "VARBINARY(MAX)"
+
 
 class IntEnumFieldInstance(SmallIntField):
     def __init__(
-        self, enum_type: Type[IntEnum], description: Optional[str] = None, **kwargs: Any
+        self,
+        enum_type: type[IntEnum],
+        description: str | None = None,
+        generated: bool = False,
+        **kwargs: Any,
     ) -> None:
         # Validate values
+        minimum = 1 if generated else -32768
         for item in enum_type:
             try:
                 value = int(item.value)
-            except ValueError:
-                raise ConfigurationError("IntEnumField only supports integer enums!")
-            if not 0 <= value < 32768:
-                raise ConfigurationError("The valid range of IntEnumField's values is 0..32767!")
+            except ValueError as e:
+                raise ConfigurationError("IntEnumField only supports integer enums!") from e
+            if not minimum <= value < 32768:
+                raise ConfigurationError(
+                    f"The valid range of IntEnumField's values is {minimum}..32767!"
+                )
 
         # Automatic description for the field if not specified by the user
         if description is None:
-            description = "\n".join([f"{e.name}: {int(e.value)}" for e in enum_type])[:2048]
+            description = "\n".join(f"{e.name}: {int(e.value)}" for e in enum_type)[:2048]
 
         super().__init__(description=description, **kwargs)
         self.enum_type = enum_type
 
-    def to_python_value(self, value: Union[int, None]) -> Union[IntEnum, None]:
-
+    def to_python_value(self, value: int | None) -> IntEnum | None:
         value = self.enum_type(value) if value is not None else None
-        self.validate(value)
         return value
 
-    def to_db_value(
-        self, value: Union[IntEnum, None, int], instance: "Union[Type[Model], Model]"
-    ) -> Union[int, None]:
-
+    def to_db_value(self, value: IntEnum | None | int, instance: type[Model] | Model) -> int | None:
         if isinstance(value, IntEnum):
             value = int(value.value)
         if isinstance(value, int):
@@ -571,10 +1011,10 @@ IntEnumType = TypeVar("IntEnumType", bound=IntEnum)
 
 
 def IntEnumField(
-    enum_type: Type[IntEnumType],
-    description: Optional[str] = None,
+    enum_type: type[IntEnumType],
+    description: str | None = None,
     **kwargs: Any,
-) -> IntEnumType:
+) -> Field[IntEnumType]:
     """
     Enum Field
 
@@ -592,39 +1032,32 @@ def IntEnumField(
         of "name: value" pairs.
 
     """
-    return IntEnumFieldInstance(enum_type, description, **kwargs)  # type: ignore
+    return IntEnumFieldInstance(enum_type, description, **kwargs)
 
 
 class CharEnumFieldInstance(CharField):
     def __init__(
         self,
-        enum_type: Type[Enum],
-        description: Optional[str] = None,
+        enum_type: type[Enum],
+        description: str | None = None,
         max_length: int = 0,
         **kwargs: Any,
     ) -> None:
         # Automatic description for the field if not specified by the user
         if description is None:
-            description = "\n".join([f"{e.name}: {str(e.value)}" for e in enum_type])[:2048]
+            description = "\n".join(f"{e.name}: {e.value!s}" for e in enum_type)[:2048]
 
         # Automatic CharField max_length
         if max_length == 0:
-            for item in enum_type:
-                item_len = len(str(item.value))
-                if item_len > max_length:
-                    max_length = item_len
+            max_length = max((len(str(i.value)) for i in enum_type), default=0)
 
         super().__init__(description=description, max_length=max_length, **kwargs)
         self.enum_type = enum_type
 
-    def to_python_value(self, value: Union[str, None]) -> Union[Enum, None]:
-        self.validate(value)
-
+    def to_python_value(self, value: str | None) -> Enum | None:
         return self.enum_type(value) if value is not None else None
 
-    def to_db_value(
-        self, value: Union[Enum, None, str], instance: "Union[Type[Model], Model]"
-    ) -> Union[str, None]:
+    def to_db_value(self, value: Enum | None | str, instance: type[Model] | Model) -> str | None:
         self.validate(value)
         if isinstance(value, Enum):
             return str(value.value)
@@ -637,11 +1070,11 @@ CharEnumType = TypeVar("CharEnumType", bound=Enum)
 
 
 def CharEnumField(
-    enum_type: Type[CharEnumType],
-    description: Optional[str] = None,
+    enum_type: type[CharEnumType],
+    description: str | None = None,
     max_length: int = 0,
     **kwargs: Any,
-) -> CharEnumType:
+) -> Field[CharEnumType]:
     """
     Char Enum Field
 
@@ -664,4 +1097,4 @@ def CharEnumField(
 
     """
 
-    return CharEnumFieldInstance(enum_type, description, max_length, **kwargs)  # type: ignore
+    return CharEnumFieldInstance(enum_type, description, max_length, **kwargs)

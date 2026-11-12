@@ -1,89 +1,370 @@
+from __future__ import annotations
+
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from pypika.terms import Function
+import pytest
+from pypika_tortoise.terms import Function as PupikaFunction
 
-from tests.testmodels import DefaultUpdate, Event, IntFields, JSONFields, Tournament
-from tortoise.contrib import test
-from tortoise.expressions import F
+from tests.testmodels import (
+    Currency,
+    DatetimeFields,
+    DefaultUpdate,
+    EnumFields,
+    Event,
+    IntFields,
+    JSONFields,
+    Reporter,
+    Service,
+    SmallIntFields,
+    SourceFieldPk,
+    Tournament,
+    UUIDFields,
+)
+from tortoise import timezone
+from tortoise.contrib.test import requireCapability
+from tortoise.contrib.test.condition import In, NotEQ
+from tortoise.expressions import Case, F, Q, Subquery, When
+from tortoise.functions import Function, Upper
+from tortoise.timezone import UTC
 
 
-class TestUpdate(test.TestCase):
-    async def test_update(self):
-        await Tournament.create(name="1")
-        await Tournament.create(name="3")
-        rows_affected = await Tournament.all().update(name="2")
-        self.assertEqual(rows_affected, 2)
+@pytest.mark.asyncio
+async def test_update(db):
+    await Tournament.create(name="1")
+    await Tournament.create(name="3")
+    rows_affected = await Tournament.all().update(name="2")
+    assert rows_affected == 2
 
-        tournament = await Tournament.first()
-        self.assertEqual(tournament.name, "2")
+    tournament = await Tournament.first()
+    assert tournament is not None
+    assert tournament.name == "2"
 
-    async def test_update_auto_now(self):
-        obj = await DefaultUpdate.create()
 
-        now = datetime.now()
-        updated_at = now - timedelta(days=1)
-        await DefaultUpdate.filter(pk=obj.pk).update(updated_at=updated_at)
+@pytest.mark.asyncio
+async def test_bulk_update(db):
+    objs = [await Tournament.create(name="1"), await Tournament.create(name="2")]
+    objs[0].name = "0"
+    objs[1].name = "1"
+    rows_affected = await Tournament.bulk_update(objs, fields=["name"], batch_size=100)
+    assert rows_affected == 2
+    assert (await Tournament.get(pk=objs[0].pk)).name == "0"
+    assert (await Tournament.get(pk=objs[1].pk)).name == "1"
 
-        obj1 = await DefaultUpdate.get(pk=obj.pk)
-        self.assertEqual(obj1.updated_at.date(), updated_at.date())
 
-    async def test_update_relation(self):
-        tournament_first = await Tournament.create(name="1")
-        tournament_second = await Tournament.create(name="2")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("object_iterator", [False, True])
+@pytest.mark.parametrize("field_iterator", [False, True])
+@pytest.mark.parametrize("batch_size", [None, 1])
+async def test_bulk_update_iterables(db, object_iterator: bool, field_iterator: bool, batch_size):
+    objects = [await Tournament.create(name="old") for _ in range(2)]
+    for i, obj in enumerate(objects, 1):
+        obj.name = f"new{i}"
+    updated_objects = iter(objects) if object_iterator else objects
+    updated_fields = iter(["name"]) if field_iterator else ["name"]
 
-        await Event.create(name="1", tournament=tournament_first)
-        await Event.all().update(tournament=tournament_second)
-        event = await Event.first()
-        self.assertEqual(event.tournament_id, tournament_second.id)
+    assert (
+        await Tournament.bulk_update(updated_objects, fields=updated_fields, batch_size=batch_size)
+        == 2
+    )
+    qs = Tournament.all().order_by("id")
+    assert await qs.values_list("name", flat=True) == ["new1", "new2"]  # type:ignore[comparison-overlap]
 
-    @test.requireCapability(dialect="mysql")
-    @test.requireCapability(dialect="sqlite")
-    async def test_update_with_custom_function(self):
-        class JsonSet(Function):
+
+@pytest.mark.asyncio
+async def test_bulk_update_iterator_still_rejects_missing_primary_key(db):
+    obj = await Tournament.create(name="old")
+    obj.name = "new"
+    with pytest.raises(ValueError, match="All bulk_update.*primary key"):
+        Tournament.bulk_update(iter([obj, Tournament(name="unsaved")]), fields=["name"])
+    assert (await Tournament.get(pk=obj.pk).only("name")).name == "old"
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_multiple_fields_batch_size(db):
+    objs = [await IntFields.create(intnum=i, intnum_null=i) for i in range(3)]
+    for obj in objs:
+        obj.intnum += 10
+        obj.intnum_null = (obj.intnum_null or 0) + 20
+    rows_affected = await IntFields.bulk_update(
+        objs, fields=["intnum", "intnum_null"], batch_size=1
+    )
+    assert rows_affected == 3
+    assert await IntFields.filter(pk__in=[o.pk for o in objs]).order_by("id").values_list(
+        "intnum", "intnum_null"
+    ) == [(10, 20), (11, 21), (12, 22)]
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_datetime(db):
+    objs = [
+        await DatetimeFields.create(datetime=datetime(2021, 1, 1, tzinfo=UTC)),
+        await DatetimeFields.create(datetime=datetime(2021, 1, 1, tzinfo=UTC)),
+    ]
+    t0 = datetime(2021, 1, 2, tzinfo=UTC)
+    t1 = datetime(2021, 1, 3, tzinfo=UTC)
+    objs[0].datetime = t0
+    objs[1].datetime = t1
+    rows_affected = await DatetimeFields.bulk_update(objs, fields=["datetime"])
+    assert rows_affected == 2
+    assert (await DatetimeFields.get(pk=objs[0].pk)).datetime == t0
+    assert (await DatetimeFields.get(pk=objs[1].pk)).datetime == t1
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_pk_non_id(db):
+    tournament = await Tournament.create(name="")
+    events = [
+        await Event.create(name="1", tournament=tournament),
+        await Event.create(name="2", tournament=tournament),
+    ]
+    events[0].name = "3"
+    events[1].name = "4"
+    rows_affected = await Event.bulk_update(events, fields=["name"])
+    assert rows_affected == 2
+    assert (await Event.get(pk=events[0].pk)).name == events[0].name
+    assert (await Event.get(pk=events[1].pk)).name == events[1].name
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_pk_uuid(db):
+    objs = [
+        await UUIDFields.create(data=uuid.uuid4()),
+        await UUIDFields.create(data=uuid.uuid4()),
+    ]
+    objs[0].data = uuid.uuid4()
+    objs[1].data = uuid.uuid4()
+    rows_affected = await UUIDFields.bulk_update(objs, fields=["data"])
+    assert rows_affected == 2
+    assert (await UUIDFields.get(pk=objs[0].pk)).data == objs[0].data
+    assert (await UUIDFields.get(pk=objs[1].pk)).data == objs[1].data
+
+
+@pytest.mark.asyncio
+async def test_bulk_renamed_pk_source_field(db):
+    objs = [
+        await SourceFieldPk.create(name="Model 1"),
+        await SourceFieldPk.create(name="Model 2"),
+    ]
+    objs[0].name = "Model 3"
+    objs[1].name = "Model 4"
+    rows_affected = await SourceFieldPk.bulk_update(objs, fields=["name"])
+    assert rows_affected == 2
+    assert (await SourceFieldPk.get(pk=objs[0].pk)).name == objs[0].name
+    assert (await SourceFieldPk.get(pk=objs[1].pk)).name == objs[1].name
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_json_value(db):
+    objs = [
+        await JSONFields.create(data={}),
+        await JSONFields.create(data={}),
+    ]
+    objs[0].data = [0]
+    objs[1].data = {"a": 1}
+    rows_affected = await JSONFields.bulk_update(objs, fields=["data"])
+    assert rows_affected == 2
+    assert (await JSONFields.get(pk=objs[0].pk)).data == objs[0].data
+    assert (await JSONFields.get(pk=objs[1].pk)).data == objs[1].data
+
+
+@requireCapability(dialect=NotEQ("mssql"))
+@pytest.mark.asyncio
+async def test_bulk_update_smallint_none(db):
+    objs = [
+        await SmallIntFields.create(smallintnum=1, smallintnum_null=1),
+        await SmallIntFields.create(smallintnum=2, smallintnum_null=2),
+    ]
+    objs[0].smallintnum_null = None
+    objs[1].smallintnum_null = None
+    rows_affected = await SmallIntFields.bulk_update(objs, fields=["smallintnum_null"])
+    assert rows_affected == 2
+    assert (await SmallIntFields.get(pk=objs[0].pk)).smallintnum_null is None
+    assert (await SmallIntFields.get(pk=objs[1].pk)).smallintnum_null is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_custom_field(db):
+    objs = [
+        await EnumFields.create(service=Service.python_programming, currency=Currency.EUR),
+        await EnumFields.create(service=Service.database_design, currency=Currency.USD),
+    ]
+    objs[0].currency = Currency.USD
+    objs[1].service = Service.system_administration
+    rows_affected = await EnumFields.bulk_update(objs, fields=["service", "currency"])
+    assert rows_affected == 2
+    assert (await EnumFields.get(pk=objs[0].pk)).currency == Currency.USD
+    assert (await EnumFields.get(pk=objs[1].pk)).service == Service.system_administration
+
+
+@pytest.mark.asyncio
+async def test_update_auto_now(db):
+    obj = await DefaultUpdate.create()
+
+    updated_at = timezone.now() - timedelta(days=1)
+    await DefaultUpdate.filter(pk=obj.pk).update(updated_at=updated_at)
+
+    obj1 = await DefaultUpdate.get(pk=obj.pk)
+    assert obj1.updated_at.date() == updated_at.date()
+
+
+@pytest.mark.asyncio
+async def test_update_relation(db):
+    tournament_first = await Tournament.create(name="1")
+    tournament_second = await Tournament.create(name="2")
+
+    await Event.create(name="1", tournament=tournament_first)
+    await Event.all().update(tournament=tournament_second)
+    event = await Event.first()
+    assert event is not None
+    assert event.tournament_id == tournament_second.id
+
+
+@requireCapability(dialect=In("mysql", "sqlite"))
+@pytest.mark.asyncio
+async def test_update_with_custom_function(db):
+    class JsonSet(Function):
+        class PypikaJsonSet(PupikaFunction):
             def __init__(self, field: F, expression: str, value: Any):
                 super().__init__("JSON_SET", field, expression, value)
 
-        json = await JSONFields.create(data={})
-        self.assertEqual(json.data_default, {"a": 1})
+        database_func = PypikaJsonSet
 
-        json.data_default = JsonSet(F("data_default"), "$.a", 2)
-        await json.save()
+    json = await JSONFields.create(data={})
+    assert json.data_default == {"a": 1}
 
-        json_update = await JSONFields.get(pk=json.pk)
-        self.assertEqual(json_update.data_default, {"a": 2})
+    json.data_default = JsonSet(F("data_default"), "$.a", 2)  # ty:ignore[invalid-assignment]
+    await json.save()
 
-        await JSONFields.filter(pk=json.pk).update(
-            data_default=JsonSet(F("data_default"), "$.a", 3)
+    json_update = await JSONFields.get(pk=json.pk)
+    assert json_update.data_default == {"a": 2}
+
+    await JSONFields.filter(pk=json.pk).update(data_default=JsonSet(F("data_default"), "$.a", 3))
+    json_update = await JSONFields.get(pk=json.pk)
+    assert json_update.data_default == {"a": 3}
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_db(db):
+    int_field = await IntFields.create(intnum=1, intnum_null=2)
+    int_field_in_db = await IntFields.get(pk=int_field.pk)
+    int_field_in_db.intnum = F("intnum") + 1  # ty:ignore[invalid-assignment]
+    await int_field_in_db.save(update_fields=["intnum"])
+    assert int_field_in_db.intnum != 2
+    assert int_field_in_db.intnum_null == 2
+
+    await int_field_in_db.refresh_from_db(fields=["intnum"])
+    assert int_field_in_db.intnum == 2
+    assert int_field_in_db.intnum_null == 2
+
+    int_field_in_db.intnum = F("intnum") + 1  # ty:ignore[invalid-assignment]
+    await int_field_in_db.save()
+    assert int_field_in_db.intnum != 3
+    assert int_field_in_db.intnum_null == 2
+
+    await int_field_in_db.refresh_from_db()
+    assert int_field_in_db.intnum == 3
+    assert int_field_in_db.intnum_null == 2
+
+
+@requireCapability(support_update_limit_order_by=True)
+@pytest.mark.asyncio
+async def test_update_with_limit_ordering(db):
+    await Tournament.create(name="1")
+    t2 = await Tournament.create(name="1")
+    await Tournament.filter(name="1").limit(1).order_by("-id").update(name="2")
+    assert (await Tournament.get(pk=t2.pk)).name == "2"
+    assert await Tournament.filter(name="1").count() == 1
+
+
+# tortoise-pypika does not translate ** to POWER in MSSQL
+@requireCapability(dialect=NotEQ("mssql"))
+@pytest.mark.asyncio
+async def test_update_with_case_when_and_f(db):
+    event1 = await IntFields.create(intnum=1)
+    event2 = await IntFields.create(intnum=2)
+    event3 = await IntFields.create(intnum=3)
+    await (
+        IntFields.all()
+        .annotate(
+            intnum_updated=Case(
+                When(
+                    Q(intnum=1),
+                    then=F("intnum") + 1,
+                ),
+                When(
+                    Q(intnum=2),
+                    then=F("intnum") * 2,
+                ),
+                default=F("intnum") ** 3,
+            )
         )
-        json_update = await JSONFields.get(pk=json.pk)
-        self.assertEqual(json_update.data_default, {"a": 3})
+        .update(intnum=F("intnum_updated"))
+    )
 
-    async def test_refresh_from_db(self):
-        int_field = await IntFields.create(intnum=1, intnum_null=2)
-        int_field_in_db = await IntFields.get(pk=int_field.pk)
-        int_field_in_db.intnum = F("intnum") + 1
-        await int_field_in_db.save(update_fields=["intnum"])
-        self.assertIsNot(int_field_in_db.intnum, 2)
-        self.assertIs(int_field_in_db.intnum_null, 2)
+    for e in [event1, event2, event3]:
+        await e.refresh_from_db()
+    assert event1.intnum == 2
+    assert event2.intnum == 4
+    assert event3.intnum == 27
 
-        await int_field_in_db.refresh_from_db(fields=["intnum"])
-        self.assertIs(int_field_in_db.intnum, 2)
-        self.assertIs(int_field_in_db.intnum_null, 2)
 
-        int_field_in_db.intnum = F("intnum") + 1
-        await int_field_in_db.save()
-        self.assertIsNot(int_field_in_db.intnum, 3)
-        self.assertIs(int_field_in_db.intnum_null, 2)
+@pytest.mark.asyncio
+async def test_update_with_function_annotation(db):
+    tournament = await Tournament.create(name="aaa")
+    await (
+        Tournament.filter(pk=tournament.pk)
+        .annotate(
+            upped_name=Upper(F("name")),
+        )
+        .update(name=F("upped_name"))
+    )
+    assert (await Tournament.get(pk=tournament.pk)).name == "AAA"
 
-        await int_field_in_db.refresh_from_db()
-        self.assertIs(int_field_in_db.intnum, 3)
-        self.assertIs(int_field_in_db.intnum_null, 2)
 
-    @test.requireCapability(support_update_limit_order_by=True)
-    async def test_update_with_limit_ordering(self):
-        await Tournament.create(name="1")
-        t2 = await Tournament.create(name="1")
-        await Tournament.filter(name="1").limit(1).order_by("-id").update(name="2")
-        self.assertIs((await Tournament.get(pk=t2.pk)).name, "2")
-        self.assertEqual(await Tournament.filter(name="1").count(), 1)
+@pytest.mark.asyncio
+async def test_update_with_filter_subquery(db):
+    t1 = await Tournament.create(name="1")
+    r1 = await Reporter.create(name="1")
+    e1 = await Event.create(name="1", tournament=t1, reporter=r1)
+
+    # NOTE: this is intentionally written with Subquery and known PKs to test
+    # whether subqueries are parameterized correctly.
+    await Event.filter(
+        tournament_id__in=Subquery(Tournament.filter(pk__in=[t1.pk]).values("id")),
+        reporter_id__in=Subquery(Reporter.filter(pk__in=[r1.pk]).values("id")),
+    ).update(token="hello_world")
+
+    await e1.refresh_from_db(fields=["token"])
+    assert e1.token == "hello_world"
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_empty_objects_or_fields(db):
+    rows = await Tournament.bulk_update([], fields=["name"])
+    rows2 = await Tournament.bulk_update(iter([]), fields=["name"])
+    assert rows == rows2 == 0
+    sql = Tournament.bulk_update([], fields=["name"]).sql()
+    sql2 = Tournament.bulk_update(iter([]), fields=["name"]).sql()
+    assert sql == sql2 == ""
+
+    objs = [await Tournament.create(name="keep")]
+    rows_empty_fields = await Tournament.bulk_update(objs, fields=[])
+    assert rows_empty_fields == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_sql_preview_does_not_duplicate_execution(db):
+    objects = [await Tournament.create(name="old") for _ in range(2)]
+    for obj in objects:
+        obj.name = "new"
+
+    query = Tournament.bulk_update(objects, fields=["name"])
+    sql1 = query.sql()
+    sql2 = query.sql()
+    assert sql1 == sql2
+    rows = await query
+    assert rows == 2
+    assert (await Tournament.get(pk=objects[0].pk)).name == "new"
+    assert (await Tournament.get(pk=objects[1].pk)).name == "new"

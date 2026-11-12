@@ -1,10 +1,8 @@
-from abc import ABCMeta
-
-from tortoise.indexes import Index
+from tortoise.indexes import PartialIndex
 
 
-class PostgreSQLIndex(Index, metaclass=ABCMeta):
-    INDEX_CREATE_TEMPLATE = "CREATE INDEX {index_name} ON {table_name} USING{index_type}({fields});"
+class PostgreSQLIndex(PartialIndex):
+    pass
 
 
 class BloomIndex(PostgreSQLIndex):

@@ -1,17 +1,75 @@
+from __future__ import annotations
+
+import functools
 import os
-from datetime import datetime, tzinfo
-from typing import Optional
+import sys
+from datetime import datetime, time, tzinfo
+from zoneinfo import ZoneInfo as _ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
-import pytz
+if sys.version_info >= (3, 11):
+    from datetime import UTC
+else:
+    from datetime import timezone
+
+    UTC = timezone.utc
+
+try:
+    from ciso8601 import parse_datetime
+except ImportError:  # pragma: nocoverage
+
+    def parse_datetime(datetime_string: str) -> datetime:
+        try:
+            return datetime.fromisoformat(datetime_string)
+        except ValueError as e:
+            try:
+                # Fallback chain (fastest first):
+                #   1. ciso8601      (C, fastest)             — used above if available
+                #   2. fromisoformat (C-accelerated on 3.11+) — used here
+                #   3. iso8601       (pure Python, slow)      — last resort only
+                # iso8601 is optional: it is unnecessary when all datetime strings are
+                # already ISO-formatted, or when ciso8601 is installed.
+                from iso8601 import parse_date as _fallback_parse
+
+                return _fallback_parse(datetime_string, default_timezone=None)
+            except ImportError as err:
+                raise e from err
 
 
+class ZoneInfo(_ZoneInfo):
+    @property
+    def zone(self) -> str:
+        # Compatible with pytz:
+        # >>> ZoneInfo('UTC').key == pytz.timezone('UTC').zone == 'UTC'
+        return self.key
+
+
+def parse_timezone(zone: str) -> tzinfo:
+    if zone.upper() == "UTC":
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(zone)
+    except ZoneInfoNotFoundError as e:
+        words = zone.split("/")
+        # Compatible with `pytz.timezone`:
+        #   US/central -> US/Central
+        #   Europe/moscow -> Europe/Moscow
+        #   asia/ShangHai -> Asia/Shanghai
+        styled = "/".join([i if i.isupper() else i.title() for i in words])
+        if styled != zone:
+            return ZoneInfo(styled)
+        raise e
+
+
+@functools.cache
 def get_use_tz() -> bool:
     """
     Get use_tz from env set in Tortoise config.
     """
-    return os.environ.get("USE_TZ") == "True"
+    return os.environ.get("USE_TZ", "True").lower() not in ("false", "0", "")
 
 
+@functools.cache
 def get_timezone() -> str:
     """
     Get timezone from env set in Tortoise config.
@@ -21,24 +79,46 @@ def get_timezone() -> str:
 
 def now() -> datetime:
     """
-    Return an aware datetime.datetime, depending on use_tz and timezone.
+    Return a datetime.datetime, aware or naive depending on use_tz setting.
+
+    When use_tz=True, returns an aware datetime in UTC.
+    When use_tz=False, returns a naive datetime.
     """
     if get_use_tz():
-        return datetime.now(tz=pytz.utc)
+        return datetime.now(tz=UTC)
     else:
-        return datetime.now(get_default_timezone())
+        return datetime.now()
 
 
+@functools.cache
 def get_default_timezone() -> tzinfo:
     """
     Return the default time zone as a tzinfo instance.
 
     This is the time zone defined by Tortoise config.
     """
-    return pytz.timezone(get_timezone())
+    return parse_timezone(get_timezone())
 
 
-def localtime(value: Optional[datetime] = None, timezone: Optional[str] = None) -> datetime:
+def _reset_timezone_cache() -> None:
+    """Reset timezone cache. For internal use only."""
+    get_default_timezone.cache_clear()
+    get_use_tz.cache_clear()
+    get_timezone.cache_clear()
+
+
+def _get_or_parse_timezone(timezone: tzinfo | str | None = None) -> tzinfo:
+    """
+    If timezone is None return get_default_timezone()
+    else if timezone is tzinfo object, return it;
+    else parse string to ZoneInfo instance.
+    """
+    if timezone is None:
+        return get_default_timezone()
+    return parse_timezone(timezone) if isinstance(timezone, str) else timezone
+
+
+def localtime(value: datetime | None = None, timezone: tzinfo | str | None = None) -> datetime:
     """
     Convert an aware datetime.datetime to local time.
 
@@ -52,18 +132,15 @@ def localtime(value: Optional[datetime] = None, timezone: Optional[str] = None) 
     """
     if value is None:
         value = now()
-    if timezone is None:
-        tz = get_default_timezone()
-    else:
-        tz = pytz.timezone(timezone)
-    if is_naive(value):
+    elif is_naive(value):
         raise ValueError("localtime() cannot be applied to a naive datetime")
+    tz = _get_or_parse_timezone(timezone)
     return value.astimezone(tz)
 
 
-def is_aware(value: datetime) -> bool:
+def is_aware(value: datetime | time) -> bool:
     """
-    Determine if a given datetime.datetime is aware.
+    Determine if a given datetime.datetime or datetime.time is aware.
 
     The concept is defined in Python's docs:
     https://docs.python.org/library/datetime.html#datetime.tzinfo
@@ -74,9 +151,9 @@ def is_aware(value: datetime) -> bool:
     return value.utcoffset() is not None
 
 
-def is_naive(value: datetime) -> bool:
+def is_naive(value: datetime | time) -> bool:
     """
-    Determine if a given datetime.datetime is naive.
+    Determine if a given datetime.datetime or datetime.time is naive.
 
     The concept is defined in Python's docs:
     https://docs.python.org/library/datetime.html#datetime.tzinfo
@@ -88,36 +165,29 @@ def is_naive(value: datetime) -> bool:
 
 
 def make_aware(
-    value: datetime, timezone: Optional[str] = None, is_dst: Optional[bool] = None
+    value: datetime, timezone: tzinfo | str | None = None, is_dst: bool | None = None
 ) -> datetime:
     """
     Make a naive datetime.datetime in a given time zone aware.
 
     :raises ValueError: when value is not naive datetime
     """
-    if timezone is None:
-        tz = get_default_timezone()
-    else:
-        tz = pytz.timezone(timezone)
+    tz = _get_or_parse_timezone(timezone)
     if hasattr(tz, "localize"):
-        return tz.localize(value, is_dst=is_dst)  # type: ignore
-    else:
-        if is_aware(value):
-            raise ValueError("make_aware expects a naive datetime, got %s" % value)
-        # This may be wrong around DST changes!
-        return value.replace(tzinfo=tz)
+        return tz.localize(value, is_dst=is_dst)  # ty:ignore[call-non-callable]
+    if is_aware(value):
+        raise ValueError(f"make_aware expects a naive datetime, got {value}")
+    # This may be wrong around DST changes!
+    return value.replace(tzinfo=tz)
 
 
-def make_naive(value: datetime, timezone: Optional[str] = None) -> datetime:
+def make_naive(value: datetime, timezone: tzinfo | str | None = None) -> datetime:
     """
     Make an aware datetime.datetime naive in a given time zone.
 
     :raises ValueError: when value is naive datetime
     """
-    if timezone is None:
-        tz = get_default_timezone()
-    else:
-        tz = pytz.timezone(timezone)
+    tz = _get_or_parse_timezone(timezone)
     if is_naive(value):
         raise ValueError("make_naive() cannot be applied to a naive datetime")
     return value.astimezone(tz).replace(tzinfo=None)

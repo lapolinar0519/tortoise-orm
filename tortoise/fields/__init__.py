@@ -1,4 +1,12 @@
-from tortoise.fields.base import CASCADE, RESTRICT, SET_DEFAULT, SET_NULL, Field
+from tortoise.fields.base import (
+    CASCADE,
+    NO_ACTION,
+    RESTRICT,
+    SET_DEFAULT,
+    SET_NULL,
+    Field,
+    OnDelete,
+)
 from tortoise.fields.data import (
     BigIntField,
     BinaryField,
@@ -15,8 +23,10 @@ from tortoise.fields.data import (
     SmallIntField,
     TextField,
     TimeDeltaField,
+    TimeField,
     UUIDField,
 )
+from tortoise.fields.db_defaults import Now, RandomHex, SqlDefault
 from tortoise.fields.relational import (
     BackwardFKRelation,
     BackwardOneToOneRelation,
@@ -30,3 +40,58 @@ from tortoise.fields.relational import (
     OneToOneRelation,
     ReverseRelation,
 )
+
+__all__ = [
+    "CASCADE",
+    "RESTRICT",
+    "SET_DEFAULT",
+    "SET_NULL",
+    "NO_ACTION",
+    "OnDelete",
+    "Field",
+    "Now",
+    "RandomHex",
+    "SqlDefault",
+    "BigIntField",
+    "BinaryField",
+    "BooleanField",
+    "CharEnumField",
+    "CharField",
+    "DateField",
+    "DatetimeField",
+    "TimeField",
+    "DecimalField",
+    "FloatField",
+    "IntEnumField",
+    "IntField",
+    "JSONField",
+    "SmallIntField",
+    "TextField",
+    "TimeDeltaField",
+    "UUIDField",
+    "BackwardFKRelation",
+    "BackwardOneToOneRelation",
+    "ForeignKeyField",
+    "ForeignKeyNullableRelation",
+    "ForeignKeyRelation",
+    "ManyToManyField",
+    "ManyToManyRelation",
+    "OneToOneField",
+    "OneToOneNullableRelation",
+    "OneToOneRelation",
+    "ReverseRelation",
+    "IntegerField",
+    "SmallIntegerField",
+    "DurationField",
+    "BigIntegerField",
+    "DateTimeField",
+    "ForeignKey",
+]
+
+# Django field name compatibility
+from tortoise.fields.data import BigIntField as BigIntegerField
+from tortoise.fields.data import DatetimeField as DateTimeField
+from tortoise.fields.data import IntField as IntegerField
+from tortoise.fields.data import SmallIntField as SmallIntegerField
+from tortoise.fields.data import TimeDeltaField as DurationField
+from tortoise.fields.relational import ForeignKeyField as ForeignKey

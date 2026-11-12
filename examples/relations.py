@@ -5,32 +5,38 @@ Key points in this example are use of ForeignKeyField and ManyToManyField
 to declare relations and use of .prefetch_related() and .fetch_related()
 to get this related objects
 """
-from tortoise import Tortoise, fields, run_async
+
+from tortoise import fields
 from tortoise.exceptions import NoValuesFetched
+from tortoise.expressions import Subquery
 from tortoise.models import Model
 
 
 class Tournament(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     name = fields.TextField()
 
     events: fields.ReverseRelation["Event"]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
 class Event(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     name = fields.TextField()
     tournament: fields.ForeignKeyRelation[Tournament] = fields.ForeignKeyField(
-        "models.Tournament", related_name="events"
+        Tournament, related_name="events"
     )
+    # class Team does not defined before Event, so we have to use '{app}.{model_class}'
     participants: fields.ManyToManyRelation["Team"] = fields.ManyToManyField(
         "models.Team", related_name="events", through="event_team"
     )
 
-    def __str__(self):
+    tournament_id: int
+    address: fields.BackwardOneToOneRelation["Address"]
+
+    def __str__(self) -> str:
         return self.name
 
 
@@ -39,27 +45,25 @@ class Address(Model):
     street = fields.CharField(max_length=128)
 
     event: fields.OneToOneRelation[Event] = fields.OneToOneField(
-        "models.Event", on_delete=fields.CASCADE, related_name="address", pk=True
+        Event, on_delete=fields.OnDelete.CASCADE, related_name="address", primary_key=True
     )
+    event_id: int
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"Address({self.city}, {self.street})"
 
 
 class Team(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     name = fields.TextField()
 
     events: fields.ManyToManyRelation[Event]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
-async def run():
-    await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["__main__"]})
-    await Tortoise.generate_schemas()
-
+async def run() -> None:
     tournament = Tournament(name="New Tournament")
     await tournament.save()
     await Event(name="Without participants", tournament_id=tournament.id).save()
@@ -93,13 +97,23 @@ async def run():
             "participants", "tournament"
         )
     )
-    print(await participants[0].fetch_related("events"))
 
-    print(await Team.fetch_for_list(participants, "events"))
+    await participants[0].fetch_related("events")
+    print(list(participants[0].events))
+
+    await Team.fetch_for_list(participants, "events")
+    for team in participants:
+        print(team.name, list(team.events))
 
     print(await Team.filter(events__tournament__id=tournament.id))
 
     print(await Event.filter(tournament=tournament))
+
+    print(await Event.filter(tournament__in=[tournament]))
+
+    print(await Event.filter(address__city__in=Subquery(Address.all().values("city"))))
+
+    print(await Tournament.filter(events__in=[event]))
 
     print(
         await Tournament.filter(events__name__in=["Test", "Prod"])
@@ -113,12 +127,16 @@ async def run():
 
     print(await Address.filter(event=event).first())
 
-    event_reload1 = await Event.filter(id=event.id).first()
+    event_reload1 = await Event.filter(id=event.id).get()
     print(await event_reload1.address)
 
-    event_reload2 = await Event.filter(id=event.id).prefetch_related("address").first()
+    event_reload2 = await Event.filter(id=event.id).prefetch_related("address").get()
     print(event_reload2.address)
+
+    print(dict(await event_reload2.address.event))
 
 
 if __name__ == "__main__":
-    run_async(run())
+    from tortoise.contrib.test import run_in_memory_sqlite
+
+    run_in_memory_sqlite(run)

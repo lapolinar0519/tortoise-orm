@@ -1,19 +1,24 @@
 """
 Tortoise PyLint plugin
 """
-from typing import Any, Dict, Iterator, List
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
 from astroid import MANAGER, inference_tip, nodes
 from astroid.exceptions import AstroidError
-from astroid.node_classes import AnnAssign, Assign
-from astroid.nodes import ClassDef
-from pylint.lint import PyLinter
+from astroid.nodes import AnnAssign, Assign, ClassDef
 
-MODELS: Dict[str, ClassDef] = {}
-FUTURE_RELATIONS: Dict[str, list] = {}
+if TYPE_CHECKING:
+    from pylint.lint import PyLinter
+
+MODELS: dict[str, ClassDef] = {}
+FUTURE_RELATIONS: dict[str, list] = {}
 
 
-def register(linter: PyLinter) -> None:
+def register(linter: PyLinter) -> None:  # pylint: disable=unused-argument
     """
     Reset state every time this is called, since we now get new AST to transform.
     """
@@ -38,9 +43,8 @@ def transform_model(cls: ClassDef) -> None:
         for mcls in cls.get_children():
             if isinstance(mcls, ClassDef):
                 for attr in mcls.get_children():
-                    if isinstance(attr, Assign):
-                        if attr.targets[0].name == "app":
-                            appname = attr.value.value
+                    if isinstance(attr, Assign) and attr.targets[0].name == "app":
+                        appname = attr.value.value
 
         mname = f"{appname}.{cls.name}"
         MODELS[mname] = cls
@@ -56,12 +60,14 @@ def transform_model(cls: ClassDef) -> None:
                     pass
                 else:
                     if attrname in ["OneToOneField", "ForeignKeyField", "ManyToManyField"]:
-                        tomodel = attr.value.args[0].value
+                        tomodel = attr.value.args[0].value if attr.value.args else ""
                         relname = ""
                         if attr.value.keywords:
                             for keyword in attr.value.keywords:
                                 if keyword.arg == "related_name":
                                     relname = keyword.value.value
+                                if keyword.arg == "model_name":
+                                    tomodel = keyword.value.value
 
                         if not relname:
                             relname = cls.name.lower() + "s"
@@ -105,7 +111,9 @@ def transform_model(cls: ClassDef) -> None:
         MANAGER.ast_from_module_name("tortoise.models").lookup("MetaInfo")[1][0].instantiate_class()
     ]
     if "id" not in cls.locals:
-        cls.locals["id"] = [nodes.ClassDef("id", None)]
+        cls.locals["id"] = [
+            nodes.ClassDef("id", None, None, None, end_lineno=None, end_col_offset=None)
+        ]
 
 
 def is_model_field(cls: ClassDef) -> bool:
@@ -120,7 +128,7 @@ def apply_type_shim(cls: ClassDef, _context: Any = None) -> Iterator[ClassDef]:
     """
     Morphs model fields to representative type
     """
-    base_nodes: List[ClassDef] = [cls]
+    base_nodes: list[ClassDef] = [cls]
 
     # Use the type inference standard
     try:

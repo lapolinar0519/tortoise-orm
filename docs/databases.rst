@@ -6,20 +6,19 @@ Databases
 
 Tortoise currently supports the following databases:
 
-* SQLite
-* PostgreSQL >= 9.4 (using ``asyncpg``)
-* MySQL/MariaDB (using ``aiomysql``)
+* SQLite (using ``aiosqlite``）
+* PostgreSQL >= 9.4 (using ``asyncpg`` or ``psycopg``)
+* MySQL/MariaDB (using ``asyncmy`` or ``aiomysql``)
+* Microsoft SQL Server (using ``asyncodbc``)
 
-To use, please ensure that ``asyncpg`` and/or ``aiomysql`` is installed.
+To use, please ensure that corresponding asyncio driver is installed.
 
 .. _db_url:
 
 DB_URL
 ======
 
-Tortoise supports specifying Database configuration in a URL form.
-
-The form is:
+Tortoise supports specifying Database configuration in a URL form. The form is:
 
 :samp:`{DB_TYPE}://{USERNAME}:{PASSWORD}@{HOST}:{PORT}/{DB_NAME}?{PARAM1}=value&{PARAM2}=value`
 
@@ -31,15 +30,60 @@ If password contains special characters it need to be URL encoded:
     >>> urllib.parse.quote_plus("kx%jj5/g")
     'kx%25jj5%2Fg'
 
+.. note::
+
+    Passwords containing ``%`` followed by valid hex digits (e.g., ``foo%bar``)
+    may not be parsed correctly from a URL string, because the URL parser interprets
+    such sequences as percent-encoded characters. If your password contains ``%``,
+    either percent-encode it (as shown above) or use the dict-based configuration
+    format instead, which bypasses URL parsing entirely:
+
+    .. code-block:: python3
+
+        await Tortoise.init(config={
+            "connections": {
+                "default": {
+                    "engine": "tortoise.backends.asyncpg",
+                    "credentials": {
+                        "host": "127.0.0.1",
+                        "port": 5432,
+                        "user": "myuser",
+                        "password": "ADM[r$VIS]",
+                        "database": "mydb",
+                    }
+                }
+            },
+            "apps": {
+                "models": {
+                    "models": ["myapp.models"],
+                    "default_connection": "default",
+                }
+            },
+        })
+
 The supported ``DB_TYPE``:
 
 ``sqlite``:
     Typically in the form of :samp:`sqlite://{DB_FILE}`
     So if the ``DB_FILE`` is "/data/db.sqlite3" then the string will be ``sqlite:///data/db.sqlite`` (note the three /'s)
-``postgres``:
+``postgres``
+    Using ``asyncpg``:
     Typically in the form of :samp:`postgres://postgres:pass@db.host:5432/somedb`
+
+    Or specifically ``asyncpg``/``psycopg`` using:
+
+    - ``psycopg``: :samp:`psycopg://postgres:pass@db.host:5432/somedb`
+    - ``asyncpg``: :samp:`asyncpg://postgres:pass@db.host:5432/somedb`
 ``mysql``:
     Typically in the form of :samp:`mysql://myuser:mypass@db.host:3306/somedb`
+``mssql``:
+    Typically in the form of :samp:`mssql://myuser:mypass@db.host:1433/somedb?driver=the odbc driver`
+    You can also pass driver options such as :samp:`encrypt` and
+    :samp:`trust_server_certificate` (or their ODBC-cased equivalents
+    :samp:`Encrypt` and :samp:`TrustServerCertificate`) which will be appended
+    to the DSN. For example::
+
+        mssql://myuser:mypass@db.host:1433/somedb?driver=ODBC%20Driver%2018%20for%20SQL%20Server&encrypt=no&trust_server_certificate=yes
 
 Capabilities
 ============
@@ -62,7 +106,7 @@ SQLite is an embedded database, and can run on a file or in-memory. Good databas
 
     For example ``DecimalField`` has precision preserved by storing values as strings, except when doing aggregates/ordering on it. In those cases we have to cast to/from floating-point numbers.
 
-    Similarily case-insensitivity is only partially implemented.
+    Similarly case-insensitivity is only partially implemented.
 
 DB URL is typically in the form of :samp:`sqlite://{DB_FILE}`
 So if the ``DB_FILE`` is "/data/db.sqlite3" then the string will be ``sqlite:///data/db.sqlite`` (note the three /'s)
@@ -70,7 +114,7 @@ So if the ``DB_FILE`` is "/data/db.sqlite3" then the string will be ``sqlite:///
 Required Parameters
 -------------------
 
-``path``:
+``file_path``:
     Path to SQLite3 file. ``:memory:`` is a special path that indicates in-memory database.
 
 Optional parameters:
@@ -90,6 +134,8 @@ PostgreSQL
 ==========
 
 DB URL is typically in the form of :samp:`postgres://postgres:pass@db.host:5432/somedb`, or, if connecting via Unix domain socket :samp:`postgres:///somedb`.
+
+To fail over between several servers, list the hosts separated by commas, each with an optional port: :samp:`postgres://postgres:pass@host1:5432,host2:5433/somedb?target_session_attrs=read-write`. This works with both ``asyncpg`` and ``psycopg``.
 
 Required Parameters
 -------------------
@@ -123,7 +169,49 @@ PostgreSQL optional parameters are pass-though parameters to the driver, see `he
 ``ssl`` (defaults to ''False``):
     Either ``True`` or a custom SSL context for self-signed certificates. See :ref:`db_ssl` for more info.
 
-In case any of ``user``, ``password``, ``host``, ``port`` parameters is missing, we are letting ``asyncpg`` retrieve it from default sources (standard PostgreSQL environment variables or default values).
+In case any of ``user``, ``password``, ``host``, ``port`` parameters is missing, we are letting ``asyncpg``/``psycopg`` retrieve it from default sources (standard PostgreSQL environment variables or default values).
+
+.. _db_password_callable:
+
+Rotating credentials
+--------------------
+
+``password`` also accepts a callable, which is invoked every time a new connection is
+opened. The callable may be synchronous or asynchronous, and must return a string.
+
+This makes Tortoise usable with short-lived credentials such as AWS RDS/Aurora IAM
+authentication tokens, Azure Entra ID tokens or Vault leases, where the password expires
+long before the pool does:
+
+.. code-block:: python3
+
+    async def get_token() -> str:
+        return await mint_short_lived_token()
+
+    await Tortoise.init(
+        config={
+            "connections": {
+                "default": {
+                    "engine": "tortoise.backends.asyncpg",
+                    "credentials": {
+                        "host": "db.host",
+                        "port": 5432,
+                        "user": "someuser",
+                        "password": get_token,
+                        "database": "somedb",
+                    },
+                }
+            },
+            "apps": {...},
+        }
+    )
+
+The callable is responsible for caching: it is awaited for every new connection the pool
+creates, so an expensive token request should be memoized until shortly before expiry.
+
+.. note::
+   Callable passwords cannot be expressed in a DB URL, so this requires dictionary
+   configuration. They are supported on the ``asyncpg`` and ``psycopg`` backends only.
 
 
 MySQL/MariaDB
@@ -158,14 +246,53 @@ MySQL optional parameters are pass-though parameters to the driver, see `here <h
     Duration to wait for connection before throwing error.
 ``echo`` (defaults to ``False``):
     Set to `True`` to echo SQL queries (debug only)
-``no_delay`` (defaults to ``None``):
-    Set to ``True`` to set TCP NO_DELAY to disable Nagle's algorithm on the socket.
 ``charset`` (defaults to ``utf8mb4``):
     Sets the character set in use
 ``ssl`` (defaults to ``False``):
     Either ``True`` or a custom SSL context for self-signed certificates. See :ref:`db_ssl` for more info.
 
 .. _db_ssl:
+
+MSSQL/Oracle
+============
+
+DB URL is typically in the form of :samp:`mssql or oracle://myuser:mypass@db.host:1433/somedb?driver={the odbc driver}`
+
+Required Parameters
+-------------------
+
+``user``:
+    Username to connect with.
+``password``:
+    Password for username.
+``host``:
+    Network host that database is available at.
+``port``:
+    Network port that database is available at. (defaults to ``1433``)
+``database``:
+    Database to use.
+``driver``:
+    The ODBC driver to use. Actual name of the ODBC driver in your `odbcinst.ini` file (you can find it's location using `odbcinst -j` command). It requires `unixodbc` to be installed in your system.
+
+Optional parameters:
+--------------------
+
+MSSQL/Oracle optional parameters are pass-though parameters to the driver, see `here <https://github.com/tortoise/asyncodbc>`__ for more details.
+
+``minsize`` (defaults to ``1``):
+    Minimum connection pool size
+``maxsize`` (defaults to ``10``):
+    Maximum connection pool size
+``pool_recycle`` (defaults to ``-1``):
+    Pool recycle timeout in seconds.
+``echo`` (defaults to ``False``):
+    Set to ``True`` to echo SQL queries (debug only)
+
+Encoding in Oracle:
+============
+
+If you get ``???`` values in Varchar fields instead of your actual text (russian/chinese/etc), then set ``NLS_LANG`` variable in your client environment to support UTF8. For example, `"American_America.UTF8"`.
+
 
 Passing in custom SSL Certificates
 ==================================
@@ -179,7 +306,7 @@ handle complex objects.
     import ssl
     ctx = ssl.create_default_context()
     # And in this example we disable validation...
-    # Please don't do this. Loot at the official Python ``ssl`` module documentation
+    # Please don't do this. Look at the official Python ``ssl`` module documentation
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
@@ -208,6 +335,7 @@ handle complex objects.
         }
     )
 
+.. _base_db_client:
 
 Base DB client
 ==============

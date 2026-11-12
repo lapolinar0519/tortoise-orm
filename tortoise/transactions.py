@@ -1,34 +1,36 @@
+from __future__ import annotations
+
+from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
+from tortoise.connection import get_connections
 from tortoise.exceptions import ParamsError
-
-current_transaction_map: dict = {}
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.backends.base.client import BaseDBAsyncClient, TransactionContext
 
-FuncType = Callable[..., Any]
+T = TypeVar("T")
+FuncType = Callable[..., T]
 F = TypeVar("F", bound=FuncType)
 
 
-def get_connection(connection_name: Optional[str]) -> "BaseDBAsyncClient":
-    from tortoise import Tortoise
-
+def _get_connection(connection_name: str | None) -> BaseDBAsyncClient:
+    conn_handler = get_connections()
     if connection_name:
-        connection = current_transaction_map[connection_name].get()
-    elif len(Tortoise._connections) == 1:
-        connection_name = list(Tortoise._connections.keys())[0]
-        connection = current_transaction_map[connection_name].get()
+        connection = conn_handler.get(connection_name)
+    elif len(conn_handler.db_config) == 1:
+        connection_name = next(iter(conn_handler.db_config.keys()))
+        connection = conn_handler.get(connection_name)
     else:
         raise ParamsError(
             "You are running with multiple databases, so you should specify"
-            f" connection_name: {list(Tortoise._connections.keys())}"
+            f" connection_name: {list(conn_handler.db_config)}"
         )
     return connection
 
 
-def in_transaction(connection_name: Optional[str] = None) -> "TransactionContext":
+def in_transaction(connection_name: str | None = None) -> TransactionContext:
     """
     Transaction context manager.
 
@@ -38,11 +40,11 @@ def in_transaction(connection_name: Optional[str] = None) -> "TransactionContext
     :param connection_name: name of connection to run with, optional if you have only
                             one db connection
     """
-    connection = get_connection(connection_name)
+    connection = _get_connection(connection_name)
     return connection._in_transaction()
 
 
-def atomic(connection_name: Optional[str] = None) -> Callable[[F], F]:
+def atomic(connection_name: str | None = None) -> Callable[[F], F]:
     """
     Transaction decorator.
 
@@ -55,7 +57,7 @@ def atomic(connection_name: Optional[str] = None) -> Callable[[F], F]:
 
     def wrapper(func: F) -> F:
         @wraps(func)
-        async def wrapped(*args, **kwargs):
+        async def wrapped(*args, **kwargs) -> T:
             async with in_transaction(connection_name):
                 return await func(*args, **kwargs)
 

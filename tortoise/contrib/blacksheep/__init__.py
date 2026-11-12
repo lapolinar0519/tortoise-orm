@@ -1,20 +1,24 @@
-import logging
-from types import ModuleType
-from typing import Dict, Iterable, Optional, Union
+from __future__ import annotations
 
-from blacksheep import JSONContent, Request, Response
+from collections.abc import Iterable
+from types import ModuleType
+
+from blacksheep import Request
 from blacksheep.server import Application
+from blacksheep.server.responses import json
 
 from tortoise import Tortoise
+from tortoise.connection import get_connections
 from tortoise.exceptions import DoesNotExist, IntegrityError
+from tortoise.log import logger
 
 
 def register_tortoise(
     app: Application,
-    config: Optional[dict] = None,
-    config_file: Optional[str] = None,
-    db_url: Optional[str] = None,
-    modules: Optional[Dict[str, Iterable[Union[str, ModuleType]]]] = None,
+    config: dict | None = None,
+    config_file: str | None = None,
+    db_url: str | None = None,
+    modules: dict[str, Iterable[str | ModuleType]] | None = None,
     generate_schemas: bool = False,
     add_exception_handlers: bool = False,
 ) -> None:
@@ -85,28 +89,29 @@ def register_tortoise(
 
     @app.on_start
     async def init_orm(context) -> None:  # pylint: disable=W0612
-        await Tortoise.init(config=config, config_file=config_file, db_url=db_url, modules=modules)
-        logging.info("Tortoise-ORM started, %s, %s", Tortoise._connections, Tortoise.apps)
+        await Tortoise.init(
+            config=config,
+            config_file=config_file,
+            db_url=db_url,
+            modules=modules,
+            _enable_global_fallback=True,
+        )
+        logger.info("Tortoise-ORM started, %s, %s", get_connections()._get_storage(), Tortoise.apps)
         if generate_schemas:
-            logging.info("Tortoise-ORM generating schema")
+            logger.info("Tortoise-ORM generating schema")
             await Tortoise.generate_schemas()
 
     @app.on_stop
     async def close_orm(context) -> None:  # pylint: disable=W0612
         await Tortoise.close_connections()
-        logging.info("Tortoise-ORM shutdown")
+        logger.info("Tortoise-ORM shutdown")
 
     if add_exception_handlers:
 
         @app.exception_handler(DoesNotExist)
-        async def doesnotexist_exception_handler(request: Request, exc: DoesNotExist):
-            return Response(status=404, content=JSONContent({"detail": str(exc)}))
+        async def doesnotexist_exception_handler(self, request: Request, exc: DoesNotExist):
+            return json({"detail": str(exc)}, 404)
 
         @app.exception_handler(IntegrityError)
-        async def integrityerror_exception_handler(request: Request, exc: IntegrityError):
-            return Response(
-                status=422,
-                content=JSONContent(
-                    {"detail": [{"loc": [], "msg": str(exc), "type": "IntegrityError"}]}
-                ),
-            )
+        async def integrityerror_exception_handler(self, request: Request, exc: IntegrityError):
+            return json({"detail": [{"loc": [], "msg": str(exc), "type": "IntegrityError"}]}, 422)
